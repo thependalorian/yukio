@@ -46,20 +46,32 @@ class YukioCLI:
         
         # Initialize TTS if voice is enabled
         if self.enable_voice:
-            try:
-                from agent.tts import TTSManager
-                self.tts_manager = TTSManager()
-                if self.tts_manager.is_available():
-                    print(f"{Colors.GREEN}✓ Voice (TTS) enabled{Colors.END}")
-                else:
-                    print(f"{Colors.YELLOW}⚠ Voice requested but Dia TTS not available{Colors.END}")
-                    print(f"{Colors.YELLOW}  Local Dia found at: yukio/dia/{Colors.END}")
-                    print(f"{Colors.YELLOW}  Install dependencies: cd dia && pip install -e .{Colors.END}")
-                    print(f"{Colors.YELLOW}  Or: pip install descript-audio-codec torch torchaudio{Colors.END}")
-                    self.enable_voice = False
-            except Exception as e:
-                print(f"{Colors.YELLOW}⚠ Voice initialization failed: {e}{Colors.END}")
+            # Check for Apple Silicon and automatically disable voice
+            import platform
+            is_apple_silicon = platform.machine() == "arm64" and platform.system() == "Darwin"
+
+            if is_apple_silicon:
+                print(f"{Colors.YELLOW}{'=' * 60}{Colors.END}")
+                print(f"{Colors.YELLOW}⚠  APPLE SILICON DETECTED - Voice Disabled{Colors.END}")
+                print(f"{Colors.YELLOW}TTS on M1/M2/M3 takes 2-5 minutes per response.{Colors.END}")
+                print(f"{Colors.YELLOW}Using text-only mode for fast responses.{Colors.END}")
+                print(f"{Colors.YELLOW}{'=' * 60}{Colors.END}")
                 self.enable_voice = False
+            else:
+                try:
+                    from agent.tts import TTSManager
+                    self.tts_manager = TTSManager()
+                    if self.tts_manager.is_available():
+                        print(f"{Colors.GREEN}✓ Voice (TTS) enabled{Colors.END}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Voice requested but Dia TTS not available{Colors.END}")
+                        print(f"{Colors.YELLOW}  Local Dia found at: yukio/dia/{Colors.END}")
+                        print(f"{Colors.YELLOW}  Install dependencies: cd dia && pip install -e .{Colors.END}")
+                        print(f"{Colors.YELLOW}  Or: pip install descript-audio-codec torch torchaudio{Colors.END}")
+                        self.enable_voice = False
+                except Exception as e:
+                    print(f"{Colors.YELLOW}⚠ Voice initialization failed: {e}{Colors.END}")
+                    self.enable_voice = False
         
     def print_banner(self):
         """Print welcome banner."""

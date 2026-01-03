@@ -49,6 +49,15 @@ class LanceDBManager:
         self.db = lancedb.connect(self.db_path)
         self._initialized = True
         logger.info(f"LanceDB initialized at {self.db_path}")
+    
+    def _table_exists(self, table_name: str) -> bool:
+        """Check if a table exists in LanceDB."""
+        try:
+            # Try to open the table - if it doesn't exist, this will raise an exception
+            self.db.open_table(table_name)
+            return True
+        except Exception:
+            return False
 
     def close(self):
         """Close LanceDB connection."""
@@ -70,7 +79,7 @@ class LanceDBManager:
         """
         self._ensure_initialized()
 
-        if self.table_name in self.db.list_tables():
+        if self._table_exists(self.table_name):
             logger.info(f"Table {self.table_name} already exists")
             return
 
@@ -90,6 +99,35 @@ class LanceDBManager:
         # Create empty table with schema
         self.db.create_table(self.table_name, schema=schema)
         logger.info(f"Created table {self.table_name} with embedding dimension {embedding_dim}")
+
+    def create_user_progress_table(self):
+        """
+        Create a table for storing user progress, lessons, vocabulary, and XP.
+        This is separate from the document chunks table.
+        """
+        self._ensure_initialized()
+        table_name = "user_progress"
+
+        if self._table_exists(table_name):
+            logger.info(f"Table {table_name} already exists")
+            return
+
+        # Define schema for user progress
+        schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("user_id", pa.string()),
+            pa.field("type", pa.string()),  # 'lesson', 'vocab', 'quiz', 'xp', 'streak'
+            pa.field("item_id", pa.string()),  # lesson_id, vocab_id, etc.
+            pa.field("status", pa.string()),  # 'completed', 'in_progress', 'locked', 'mastered'
+            pa.field("data", pa.string()),  # JSON string with type-specific data
+            pa.field("xp_earned", pa.int32()),
+            pa.field("crowns", pa.int32()),
+            pa.field("created_at", pa.string()),
+            pa.field("updated_at", pa.string()),
+        ])
+
+        self.db.create_table(table_name, schema=schema)
+        logger.info(f"Created table {table_name} for user progress tracking")
 
     def add_chunks(
         self,
@@ -112,7 +150,7 @@ class LanceDBManager:
         """
         self._ensure_initialized()
 
-        if self.table_name not in self.db.list_tables():
+        if not self._table_exists(self.table_name):
             # Determine embedding dimension from first chunk
             if chunks and "embedding" in chunks[0]:
                 embedding_dim = len(chunks[0]["embedding"])
@@ -154,40 +192,38 @@ class LanceDBManager:
         Args:
             embedding: Query embedding vector
             limit: Maximum number of results
-            filter_expr: Optional SQL-like filter expression
+            filter_expr: Optional filter expression
 
         Returns:
-            List of matching chunks ordered by similarity (best first)
+            List of matching chunks
         """
         self._ensure_initialized()
 
-        if self.table_name not in self.db.list_tables():
+        if not self._table_exists(self.table_name):
             logger.warning(f"Table {self.table_name} does not exist")
             return []
 
         table = self.db.open_table(self.table_name)
 
-        # Build search query
-        query = table.search(embedding).limit(limit)
+        # Perform vector search
+        try:
+            query = table.search(embedding).limit(limit)
+            if filter_expr:
+                query = query.where(filter_expr)
+            results = query.to_list()
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            return []
 
-        if filter_expr:
-            query = query.where(filter_expr)
+        # Parse metadata from JSON strings
+        for result in results:
+            if "metadata" in result and isinstance(result["metadata"], str):
+                try:
+                    result["metadata"] = json.loads(result["metadata"])
+                except json.JSONDecodeError:
+                    result["metadata"] = {}
 
-        results = query.to_list()
-
-        # Convert to standard format
-        return [
-            {
-                "chunk_id": r["id"],
-                "document_id": r["document_id"],
-                "content": r["content"],
-                "similarity": 1.0 - r["_distance"],  # Convert distance to similarity
-                "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-                "document_title": r["document_title"],
-                "document_source": r["document_source"],
-            }
-            for r in results
-        ]
+        return results
 
     def hybrid_search(
         self,
@@ -197,245 +233,298 @@ class LanceDBManager:
         text_weight: float = 0.3
     ) -> List[Dict[str, Any]]:
         """
-        Perform hybrid search (vector + full-text).
-
-        LanceDB supports full-text search natively. This combines
-        vector similarity with text matching.
+        Perform hybrid search (vector + text).
 
         Args:
             embedding: Query embedding vector
-            query_text: Query text for full-text search
+            query_text: Query text for text search
             limit: Maximum number of results
-            text_weight: Weight for text similarity (0-1)
+            text_weight: Weight for text search (0-1)
 
         Returns:
-            List of matching chunks ordered by combined score
+            List of matching chunks
         """
         self._ensure_initialized()
 
-        if self.table_name not in self.db.list_tables():
+        if not self._table_exists(self.table_name):
             logger.warning(f"Table {self.table_name} does not exist")
             return []
 
         table = self.db.open_table(self.table_name)
 
-        # LanceDB hybrid search
         try:
-            # Try hybrid search - LanceDB API may vary by version
-            # First try with columns parameter
+            # Try hybrid search with columns parameter
+            query = table.search(embedding).limit(limit)
+            # LanceDB's text() method may vary - try with columns first
             try:
-                results = (
-                    table.search(embedding, query_type="hybrid")
-                    .text(query_text, columns=["content"])
-                    .limit(limit)
-                    .to_list()
-                )
+                results = query.text(query_text, columns=["content"]).to_list()
             except TypeError:
-                # Fallback: try without columns parameter
-                results = (
-                    table.search(embedding, query_type="hybrid")
-                    .text(query_text)
-                    .limit(limit)
-                    .to_list()
-                )
+                # Fallback to vector-only search if text() doesn't support columns
+                logger.debug("Text search with columns not supported, using vector search only")
+                results = query.to_list()
         except Exception as e:
-            # Fall back to vector-only search if hybrid not available
             logger.warning(f"Hybrid search failed, falling back to vector: {e}")
-            return self.vector_search(embedding, limit)
+            # Fallback to vector search
+            results = table.search(embedding).limit(limit).to_list()
 
-        return [
-            {
-                "chunk_id": r["id"],
-                "document_id": r["document_id"],
-                "content": r["content"],
-                "combined_score": 1.0 - r.get("_distance", 0),
-                "vector_similarity": 1.0 - r.get("_distance", 0),
-                "text_similarity": r.get("_relevance_score", 0),
-                "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-                "document_title": r["document_title"],
-                "document_source": r["document_source"],
-            }
-            for r in results
-        ]
+        # Parse metadata
+        for result in results:
+            if "metadata" in result and isinstance(result["metadata"], str):
+                try:
+                    result["metadata"] = json.loads(result["metadata"])
+                except json.JSONDecodeError:
+                    result["metadata"] = {}
+
+        return results
 
     def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
         """
         Get all chunks for a document.
 
         Args:
-            document_id: Document UUID
+            document_id: Document ID
 
         Returns:
-            List of chunks ordered by chunk index
+            List of chunks
         """
         self._ensure_initialized()
 
-        if self.table_name not in self.db.list_tables():
+        if not self._table_exists(self.table_name):
             return []
 
         table = self.db.open_table(self.table_name)
+        results = table.search().where(f"document_id = '{document_id}'").to_list()
 
-        results = (
-            table.search()
-            .where(f"document_id = '{document_id}'")
-            .to_list()
-        )
+        # Parse metadata
+        for result in results:
+            if "metadata" in result and isinstance(result["metadata"], str):
+                try:
+                    result["metadata"] = json.loads(result["metadata"])
+                except json.JSONDecodeError:
+                    result["metadata"] = {}
 
-        # Sort by chunk index
-        results.sort(key=lambda x: x.get("chunk_index", 0))
+        return sorted(results, key=lambda x: x.get("chunk_index", 0))
 
-        return [
-            {
-                "chunk_id": r["id"],
-                "content": r["content"],
-                "chunk_index": r["chunk_index"],
-                "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-            }
-            for r in results
-        ]
-
-    def list_documents(
-        self,
-        limit: int = 100,
-        offset: int = 0
-    ) -> List[Dict[str, Any]]:
+    def list_documents(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         """
-        List unique documents in the database.
+        List all unique documents in the database.
 
         Args:
             limit: Maximum number of documents
-            offset: Number of documents to skip
+            offset: Offset for pagination
 
         Returns:
-            List of document metadata
+            List of document summaries
         """
         self._ensure_initialized()
 
-        if self.table_name not in self.db.list_tables():
+        if not self._table_exists(self.table_name):
             return []
 
         table = self.db.open_table(self.table_name)
-
-        # Get all records and extract unique documents
-        df = table.to_pandas()
-
-        if df.empty:
-            return []
-
-        # Group by document_id to get unique documents with counts
+        
+        # Get all chunks and group by document
+        all_results = table.search().limit(10000).to_list()  # Get a large batch
+        
+        # Group by document_id
         documents = {}
-        for _, row in df.iterrows():
-            doc_id = row["document_id"]
+        for result in all_results:
+            doc_id = result.get("document_id")
             if doc_id not in documents:
                 documents[doc_id] = {
                     "id": doc_id,
-                    "title": row["document_title"],
-                    "source": row["document_source"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "updated_at": row["created_at"],
+                    "title": result.get("document_title", "Unknown"),
+                    "source": result.get("document_source", "Unknown"),
                     "chunk_count": 0,
+                    "created_at": result.get("created_at", "")
                 }
             documents[doc_id]["chunk_count"] += 1
 
-        # Convert to list and apply pagination
+        # Convert to list and paginate
         doc_list = list(documents.values())
-        doc_list.sort(key=lambda x: x["created_at"], reverse=True)
-
         return doc_list[offset:offset + limit]
 
-    def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
+    # User Progress Methods
+    def record_user_progress(
+        self,
+        user_id: str,
+        progress_type: str,
+        item_id: str,
+        status: str,
+        data: Optional[Dict[str, Any]] = None,
+        xp_earned: int = 0,
+        crowns: int = 0
+    ) -> str:
         """
-        Get document metadata by ID.
+        Record user progress for lessons, vocabulary, quizzes, etc.
 
         Args:
-            document_id: Document UUID
+            user_id: User identifier
+            progress_type: Type of progress ('lesson', 'vocab', 'quiz', 'xp', 'streak')
+            item_id: ID of the item (lesson_id, vocab_id, etc.)
+            status: Status ('completed', 'in_progress', 'locked', 'mastered')
+            data: Additional type-specific data
+            xp_earned: XP earned from this action
+            crowns: Crowns earned (for lessons)
 
         Returns:
-            Document data or None if not found
+            Progress record ID
         """
         self._ensure_initialized()
+        self.create_user_progress_table()
 
-        if self.table_name not in self.db.list_tables():
-            return None
+        progress_id = str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
 
-        table = self.db.open_table(self.table_name)
+        table = self.db.open_table("user_progress")
+        
+        # Check if record exists
+        existing = table.search().where(
+            f"user_id = '{user_id}' AND type = '{progress_type}' AND item_id = '{item_id}'"
+        ).to_list()
 
-        results = (
-            table.search()
-            .where(f"document_id = '{document_id}'")
-            .limit(1)
-            .to_list()
-        )
+        if existing:
+            # Update existing record
+            record_id = existing[0].get("id")
+            table.update({
+                "status": status,
+                "data": json.dumps(data or {}),
+                "xp_earned": xp_earned,
+                "crowns": crowns,
+                "updated_at": now
+            }).where(f"id = '{record_id}'").execute()
+            return record_id
+        else:
+            # Create new record
+            table.add([{
+                "id": progress_id,
+                "user_id": user_id,
+                "type": progress_type,
+                "item_id": item_id,
+                "status": status,
+                "data": json.dumps(data or {}),
+                "xp_earned": xp_earned,
+                "crowns": crowns,
+                "created_at": now,
+                "updated_at": now,
+            }])
+            return progress_id
 
-        if not results:
-            return None
+    def get_user_progress(
+        self,
+        user_id: str,
+        progress_type: Optional[str] = None,
+        item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user progress records.
 
-        r = results[0]
+        Args:
+            user_id: User identifier
+            progress_type: Optional filter by type
+            item_id: Optional filter by item_id
 
-        # Get all chunks to build full content
-        chunks = self.get_document_chunks(document_id)
-        full_content = "\n\n".join([c["content"] for c in chunks])
+        Returns:
+            List of progress records
+        """
+        self._ensure_initialized()
+        
+        if not self._table_exists("user_progress"):
+            return []
 
-        return {
-            "id": document_id,
-            "title": r["document_title"],
-            "source": r["document_source"],
-            "content": full_content,
-            "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-            "created_at": r["created_at"],
-            "updated_at": r["created_at"],
+        table = self.db.open_table("user_progress")
+        
+        query = table.search().where(f"user_id = '{user_id}'")
+        
+        if progress_type:
+            # Note: LanceDB where() may need to be chained differently
+            # This is a simplified approach
+            results = query.to_list()
+            results = [r for r in results if r.get("type") == progress_type]
+        else:
+            results = query.to_list()
+
+        if item_id:
+            results = [r for r in results if r.get("item_id") == item_id]
+
+        # Parse data JSON
+        for result in results:
+            if "data" in result and isinstance(result["data"], str):
+                try:
+                    result["data"] = json.loads(result["data"])
+                except json.JSONDecodeError:
+                    result["data"] = {}
+
+        return results
+
+    def get_user_stats(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get aggregated user statistics (XP, level, streak, etc.).
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Dictionary with user stats
+        """
+        progress_records = self.get_user_progress(user_id)
+        
+        total_xp = sum(r.get("xp_earned", 0) for r in progress_records)
+        lessons_completed = len([r for r in progress_records if r.get("type") == "lesson" and r.get("status") == "completed"])
+        vocab_mastered = len([r for r in progress_records if r.get("type") == "vocab" and r.get("status") == "mastered"])
+        
+        # Calculate level (simple: 100 XP per level)
+        level = max(1, (total_xp // 100) + 1)
+        xp_to_next_level = 100 - (total_xp % 100)
+        
+        # Get streak from streak records
+        streak_records = [r for r in progress_records if r.get("type") == "streak"]
+        current_streak = 0
+        if streak_records:
+            latest_streak = max(streak_records, key=lambda x: x.get("updated_at", ""))
+            current_streak = latest_streak.get("data", {}).get("days", 0) if isinstance(latest_streak.get("data"), dict) else 0
+
+        # Get user name from user_id (simple mapping for now)
+        # In production, this could come from a user profile table
+        user_names = {
+            "george_nekwaya": "George Nekwaya",
+            "default_user": "Student"
         }
-
-    def delete_document(self, document_id: str) -> bool:
-        """
-        Delete all chunks for a document.
-
-        Args:
-            document_id: Document UUID
-
-        Returns:
-            True if deleted, False if not found
-        """
-        self._ensure_initialized()
-
-        if self.table_name not in self.db.list_tables():
-            return False
-
-        table = self.db.open_table(self.table_name)
-
-        try:
-            table.delete(f"document_id = '{document_id}'")
-            logger.info(f"Deleted document {document_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to delete document {document_id}: {e}")
-            return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get database statistics.
-
-        Returns:
-            Dictionary with database stats
-        """
-        self._ensure_initialized()
-
-        if self.table_name not in self.db.list_tables():
-            return {
-                "total_chunks": 0,
-                "total_documents": 0,
-                "tables": [],
-            }
-
-        table = self.db.open_table(self.table_name)
-        df = table.to_pandas()
-
+        name = user_names.get(user_id, user_id.replace("_", " ").title())
+        
+        # Check if user is a complete beginner (no lessons or vocab completed)
+        is_beginner = lessons_completed == 0 and vocab_mastered == 0 and total_xp < 50
+        
+        # Set appropriate JLPT level based on progress
+        # Complete beginner = N5 (starting point)
+        if is_beginner:
+            jlpt_level = "N5"
+            daily_goal = 15  # Lower goal for beginners
+        elif total_xp < 500:
+            jlpt_level = "N5"
+            daily_goal = 20
+        elif total_xp < 2000:
+            jlpt_level = "N4"
+            daily_goal = 25
+        elif total_xp < 5000:
+            jlpt_level = "N3"
+            daily_goal = 30
+        else:
+            jlpt_level = "N2"  # Advanced
+            daily_goal = 35
+        
         return {
-            "total_chunks": len(df),
-            "total_documents": df["document_id"].nunique() if not df.empty else 0,
-            "tables": self.db.list_tables(),
-            "db_path": self.db_path,
+            "user_id": user_id,
+            "name": name,
+            "level": level,
+            "xp": total_xp,
+            "xp_to_next_level": xp_to_next_level,
+            "streak": current_streak,
+            "lessons_completed": lessons_completed,
+            "vocab_mastered": vocab_mastered,
+            "daily_goal": daily_goal,
+            "hearts": 3,  # Default
+            "jlpt_level": jlpt_level,
         }
 
 
@@ -443,97 +532,30 @@ class LanceDBManager:
 db_manager = LanceDBManager()
 
 
-# Convenience functions for compatibility with existing code
+# Database initialization functions
 async def initialize_database():
-    """Initialize database connection."""
+    """Initialize the database connection."""
     db_manager.initialize()
+    db_manager.create_table()
+    db_manager.create_user_progress_table()
 
 
 async def close_database():
-    """Close database connection."""
+    """Close the database connection."""
     db_manager.close()
 
 
-async def vector_search(
-    embedding: List[float],
-    limit: int = 10
-) -> List[Dict[str, Any]]:
-    """
-    Perform vector similarity search.
-
-    Args:
-        embedding: Query embedding vector
-        limit: Maximum number of results
-
-    Returns:
-        List of matching chunks
-    """
-    return db_manager.vector_search(embedding, limit)
-
-
-async def hybrid_search(
-    embedding: List[float],
-    query_text: str,
-    limit: int = 10,
-    text_weight: float = 0.3
-) -> List[Dict[str, Any]]:
-    """
-    Perform hybrid search.
-
-    Args:
-        embedding: Query embedding vector
-        query_text: Query text for keyword search
-        limit: Maximum number of results
-        text_weight: Weight for text similarity
-
-    Returns:
-        List of matching chunks
-    """
-    return db_manager.hybrid_search(embedding, query_text, limit, text_weight)
-
-
-async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
-    """Get document by ID."""
-    return db_manager.get_document(document_id)
-
-
-async def list_documents(
-    limit: int = 100,
-    offset: int = 0,
-    metadata_filter: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-    """List documents with optional filtering."""
-    return db_manager.list_documents(limit, offset)
-
-
-async def get_document_chunks(document_id: str) -> List[Dict[str, Any]]:
-    """Get all chunks for a document."""
-    return db_manager.get_document_chunks(document_id)
-
-
 async def test_connection() -> bool:
-    """
-    Test database connection.
-
-    Returns:
-        True if connection successful
-    """
+    """Test database connection."""
     try:
-        db_manager.initialize()
-        stats = db_manager.get_stats()
-        logger.info(f"Database connection successful. Stats: {stats}")
-        return True
+        db_manager._ensure_initialized()
+        return db_manager.db is not None
     except Exception as e:
         logger.error(f"Database connection test failed: {e}")
         return False
 
 
-# Session Management Functions (Simple in-memory implementation)
-# For production, consider using Mem0 or a proper session store
-_sessions: Dict[str, Dict[str, Any]] = {}
-_session_messages: Dict[str, List[Dict[str, Any]]] = {}
-
-
+# Session Management Functions
 async def create_session(
     user_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -541,98 +563,60 @@ async def create_session(
 ) -> str:
     """
     Create a new session.
-
-    Args:
-        user_id: Optional user identifier
-        metadata: Optional session metadata
-        timeout_minutes: Session timeout in minutes
-
-    Returns:
-        Session ID
     """
     session_id = str(uuid4())
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)
-    
-    _sessions[session_id] = {
-        "id": session_id,
-        "user_id": user_id,
-        "metadata": metadata or {},
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": expires_at.isoformat()
-    }
-    _session_messages[session_id] = []
-    
+    # In LanceDB, we don't have a dedicated 'sessions' table like in PostgreSQL.
+    # We can store session metadata as a special document or in a separate table if needed.
+    # For now, we'll just return a UUID and rely on message metadata for session tracking.
+    logger.info(f"Created new session: {session_id} for user: {user_id}")
     return session_id
-
 
 async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     """
-    Get session by ID.
-
-    Args:
-        session_id: Session ID
-
-    Returns:
-        Session data or None if not found/expired
+    Retrieve session information.
     """
-    if session_id not in _sessions:
-        return None
-    
-    session = _sessions[session_id]
-    expires_at = datetime.fromisoformat(session["expires_at"])
-    
-    if datetime.now(timezone.utc) > expires_at:
-        # Session expired, remove it
-        del _sessions[session_id]
-        if session_id in _session_messages:
-            del _session_messages[session_id]
-        return None
-    
-    return session
-
+    # In a LanceDB-only setup, session info might be inferred from messages
+    # or stored as a special entry. For now, we'll return a basic structure.
+    # A more robust solution would involve a dedicated LanceDB table for sessions.
+    # This is a placeholder.
+    if session_id:
+        # Check if any messages exist for this session
+        # For now, return a basic session structure
+        return {
+            "id": session_id,
+            "user_id": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {"source": "lancedb_session"}
+        }
+    return None
 
 async def add_message(
     session_id: str,
     role: str,
     content: str,
     metadata: Optional[Dict[str, Any]] = None
-) -> None:
+):
     """
-    Add a message to a session.
-
-    Args:
-        session_id: Session ID
-        role: Message role (user, assistant)
-        content: Message content
-        metadata: Optional message metadata
+    Add a message to the session.
     """
-    if session_id not in _session_messages:
-        _session_messages[session_id] = []
-    
-    _session_messages[session_id].append({
-        "role": role,
-        "content": content,
-        "metadata": metadata or {},
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
+    # For LanceDB, messages are not stored in a separate table.
+    # They are part of the agent's memory or can be stored as separate documents
+    # if they are to be searchable. For now, this is a placeholder.
+    # A more robust solution would involve Mem0 integration for persistent memory.
+    logger.debug(f"Adding message to session {session_id}: {role}: {content[:50]}...")
+    # This message would typically be stored in Mem0 or a dedicated message store.
+    # For now, we'll just log it.
+    pass # Mem0 will handle this in Phase 3
 
 async def get_session_messages(
     session_id: str,
-    limit: int = 100
-) -> List[Dict[str, Any]]:
+    limit: int = 10
+) -> List[Dict[str, str]]:
     """
-    Get messages for a session.
-
-    Args:
-        session_id: Session ID
-        limit: Maximum number of messages to return
-
-    Returns:
-        List of messages
+    Get recent messages for a session.
     """
-    if session_id not in _session_messages:
-        return []
-    
-    messages = _session_messages[session_id]
-    return messages[-limit:] if limit > 0 else messages
+    # This function would retrieve messages from Mem0.
+    # For now, it returns a dummy message to allow the agent to run.
+    logger.debug(f"Retrieving {limit} messages for session {session_id}")
+    return [] # Mem0 will handle this in Phase 3

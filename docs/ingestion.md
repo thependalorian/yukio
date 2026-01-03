@@ -120,6 +120,32 @@ During ingestion, the pipeline automatically extracts valuable metadata for each
 
 This metadata allows the AI agent to perform targeted searches, such as "find N3 grammar examples" or "get me a vocabulary list about food."
 
+### How Ingested Data is Used
+
+Once ingested, the data in LanceDB is used by the RAG agent to:
+
+1. **Generate Structured Lessons** (`GET /lessons`)
+   - Searches for relevant content based on category/JLPT level
+   - Uses LLM to structure into lesson format with title, description, XP, etc.
+
+2. **Extract Vocabulary** (`GET /vocabulary`)
+   - Finds vocabulary words from materials
+   - Structures with Japanese, reading, romaji, English, examples
+
+3. **Create Quiz Questions** (`GET /quiz/questions`)
+   - Generates questions from grammar/vocabulary content
+   - Creates multiple-choice, type-answer, and other question types
+
+4. **Extract Voice Phrases** (`GET /voice/phrases`)
+   - Finds phrases suitable for pronunciation practice
+   - Includes romaji for TTS compatibility
+
+5. **Answer Questions** (`POST /chat`)
+   - Uses RAG search to find relevant content
+   - Provides accurate, context-aware answers
+
+All learning content is **dynamically generated** from your ingested materials, not pre-defined!
+
 ---
 
 ## 4. Troubleshooting

@@ -84,10 +84,18 @@ python cli.py --voice
 ```
 
 ### Running the API Server
-To run the FastAPI server (for a future web frontend):
+To run the FastAPI server (for the web frontend):
 ```bash
+# Method 1: Using Python module
+python -m agent.api
+
+# Method 2: Using uvicorn directly
 uvicorn agent.api:app --reload --port 8058
 ```
+
+The API will be available at `http://localhost:8058`
+
+**Note**: The frontend (`yukio-frontend`) expects the backend on port 8058. Make sure this port matches your `.env.local` configuration in the frontend.
 
 ## 4. Troubleshooting
 

@@ -260,3 +260,80 @@ class HealthStatus(BaseModel):
     llm_connection: bool  # Ollama LLM
     version: str
     timestamp: datetime
+
+
+# User Progress Models
+class UserProgress(BaseModel):
+    """User progress model for gamification."""
+    user_id: str
+    name: str = "Student"
+    level: int = 1
+    xp: int = 0
+    xp_to_next_level: int = 100
+    streak: int = 0
+    daily_goal: int = 20
+    hearts: int = 3
+    jlpt_level: str = "N5"
+    lessons_completed: int = 0
+    vocab_mastered: int = 0
+
+
+class ProgressRecord(BaseModel):
+    """Individual progress record."""
+    user_id: str
+    progress_type: Literal["lesson", "vocab", "quiz", "xp", "streak"]
+    item_id: str
+    status: Literal["completed", "in_progress", "locked", "mastered"]
+    data: Dict[str, Any] = Field(default_factory=dict)
+    xp_earned: int = 0
+    crowns: int = 0
+
+
+# Learning Content Models
+class Lesson(BaseModel):
+    """Lesson model."""
+    id: str
+    title: str
+    titleJP: Optional[str] = None
+    description: str
+    xp: int
+    crowns: int
+    status: Literal["locked", "available", "in-progress", "completed"] = "available"
+    jlpt: Literal["N5", "N4", "N3", "N2", "N1"] = "N5"
+    category: Literal["hiragana", "katakana", "kanji", "grammar", "vocabulary"]
+    content: Optional[str] = None  # Full lesson content
+
+
+class VocabWord(BaseModel):
+    """Vocabulary word model."""
+    id: str
+    japanese: str
+    reading: str
+    romaji: str
+    english: str
+    example: Optional[str] = None
+    exampleReading: Optional[str] = None
+    exampleTranslation: Optional[str] = None
+    jlpt: str
+
+
+class QuizQuestion(BaseModel):
+    """Quiz question model."""
+    id: str
+    type: Literal["multiple-choice", "type-answer", "match", "listen"]
+    question: str
+    questionJP: Optional[str] = None
+    options: Optional[List[str]] = None
+    correctAnswer: str
+    explanation: Optional[str] = None
+    audioUrl: Optional[str] = None
+
+
+class VoicePhrase(BaseModel):
+    """Voice practice phrase model."""
+    id: str
+    japanese: str
+    romaji: str
+    english: str
+    difficulty: Literal["easy", "medium", "hard"] = "easy"
+    category: str

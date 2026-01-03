@@ -32,11 +32,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from .db_utils import (
-    vector_search,
-    hybrid_search,
-    get_document,
-    list_documents,
-    get_document_chunks
+    db_manager
 )
 from .memory_utils import get_memory, recall, get_progress
 from .models import ChunkResult, DocumentMetadata
@@ -140,24 +136,52 @@ async def vector_search_tool(input_data: VectorSearchInput) -> List[ChunkResult]
         embedding = await generate_embedding(input_data.query)
 
         # Perform vector search
-        results = await vector_search(
+        results = db_manager.vector_search(
             embedding=embedding,
             limit=input_data.limit
         )
 
         # Convert to ChunkResult models
-        return [
-            ChunkResult(
-                chunk_id=str(r["chunk_id"]),
-                document_id=str(r["document_id"]),
-                content=r["content"],
-                score=r["similarity"],
-                metadata=r["metadata"],
-                document_title=r["document_title"],
-                document_source=r["document_source"]
-            )
-            for r in results
-        ]
+        # LanceDB returns 'id' not 'chunk_id', and '_distance' not 'similarity'
+        chunk_results = []
+        for r in results:
+            try:
+                # Safely extract fields - LanceDB uses 'id' not 'chunk_id'
+                chunk_id = str(r.get("id", "")) if isinstance(r, dict) else ""
+                if not chunk_id:
+                    logger.warning(f"Skipping result with missing 'id' field: {r}")
+                    continue
+                
+                # Extract distance and convert to similarity score
+                distance = r.get("_distance", 0.0)
+                if isinstance(distance, (int, float)):
+                    # Convert distance to similarity (0-1 scale, higher is better)
+                    # Distance is typically 0-2, so similarity = 1 - (distance / 2)
+                    score = max(0.0, min(1.0, 1.0 - (float(distance) / 2.0)))
+                else:
+                    score = 0.0
+                
+                # Extract metadata - already parsed as dict by db_utils
+                metadata = r.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                
+                chunk_results.append(
+                    ChunkResult(
+                        chunk_id=chunk_id,
+                        document_id=str(r.get("document_id", "")),
+                        content=str(r.get("content", r.get("text", ""))),
+                        score=score,
+                        metadata=metadata,
+                        document_title=str(r.get("document_title", r.get("title", "Unknown"))),
+                        document_source=str(r.get("document_source", r.get("source", "")))
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Error processing search result: {e}, result: {r}")
+                continue
+        
+        return chunk_results
 
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
@@ -183,7 +207,7 @@ async def hybrid_search_tool(input_data: HybridSearchInput) -> List[ChunkResult]
         embedding = await generate_embedding(input_data.query)
 
         # Perform hybrid search
-        results = await hybrid_search(
+        results = db_manager.hybrid_search(
             embedding=embedding,
             query_text=input_data.query,
             limit=input_data.limit,
@@ -191,18 +215,46 @@ async def hybrid_search_tool(input_data: HybridSearchInput) -> List[ChunkResult]
         )
 
         # Convert to ChunkResult models
-        return [
-            ChunkResult(
-                chunk_id=str(r["chunk_id"]),
-                document_id=str(r["document_id"]),
-                content=r["content"],
-                score=r.get("combined_score", r.get("similarity", 0)),
-                metadata=r["metadata"],
-                document_title=r["document_title"],
-                document_source=r["document_source"]
-            )
-            for r in results
-        ]
+        # LanceDB returns 'id' not 'chunk_id', and '_distance' not 'similarity'
+        chunk_results = []
+        for r in results:
+            try:
+                # Safely extract fields - LanceDB uses 'id' not 'chunk_id'
+                chunk_id = str(r.get("id", "")) if isinstance(r, dict) else ""
+                if not chunk_id:
+                    logger.warning(f"Skipping result with missing 'id' field: {r}")
+                    continue
+                
+                # Extract distance and convert to similarity score
+                distance = r.get("_distance", 0.0)
+                if isinstance(distance, (int, float)):
+                    # Convert distance to similarity (0-1 scale, higher is better)
+                    score = max(0.0, min(1.0, 1.0 - (float(distance) / 2.0)))
+                else:
+                    # Try other score fields
+                    score = float(r.get("combined_score", r.get("similarity", 0.0)))
+                
+                # Extract metadata - already parsed as dict by db_utils
+                metadata = r.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                
+                chunk_results.append(
+                    ChunkResult(
+                        chunk_id=chunk_id,
+                        document_id=str(r.get("document_id", "")),
+                        content=str(r.get("content", r.get("text", ""))),
+                        score=score,
+                        metadata=metadata,
+                        document_title=str(r.get("document_title", r.get("title", "Unknown"))),
+                        document_source=str(r.get("document_source", r.get("source", "")))
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Error processing hybrid search result: {e}, result: {r}")
+                continue
+        
+        return chunk_results
 
     except Exception as e:
         logger.error(f"Hybrid search failed: {e}")
@@ -220,14 +272,22 @@ async def get_document_tool(input_data: DocumentInput) -> Optional[Dict[str, Any
         Document data or None
     """
     try:
-        document = await get_document(input_data.document_id)
-
-        if document:
-            # Also get all chunks for the document
-            chunks = await get_document_chunks(input_data.document_id)
-            document["chunks"] = chunks
-
-        return document
+        # Get all chunks for the document
+        chunks = db_manager.get_document_chunks(input_data.document_id)
+        
+        if chunks:
+            # Build document from chunks
+            first_chunk = chunks[0]
+            document = {
+                "id": first_chunk.get("document_id"),
+                "title": first_chunk.get("document_title"),
+                "source": first_chunk.get("document_source"),
+                "chunks": chunks,
+                "chunk_count": len(chunks)
+            }
+            return document
+        
+        return None
 
     except Exception as e:
         logger.error(f"Document retrieval failed: {e}")
@@ -245,7 +305,7 @@ async def list_documents_tool(input_data: DocumentListInput) -> List[DocumentMet
         List of document metadata
     """
     try:
-        documents = await list_documents(
+        documents = db_manager.list_documents(
             limit=input_data.limit,
             offset=input_data.offset
         )

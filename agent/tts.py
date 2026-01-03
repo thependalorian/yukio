@@ -25,6 +25,9 @@ Usage:
 import logging
 import os
 import sys
+import platform
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, Union
 import hashlib
@@ -78,14 +81,25 @@ class TTSManager:
 
         self.model = None
         self.is_loaded = False
+        self.use_native_tts = False
 
-        # Create cache directory if caching is enabled
-        if self.enable_cache:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self._load_cache_index()
+        # Check if we should use macOS native TTS (faster on Apple Silicon)
+        is_apple_silicon = platform.machine() == "arm64" and platform.system() == "Darwin"
+        use_native_env = os.getenv("YUKIO_USE_NATIVE_TTS", "").lower() in ("1", "true", "yes")
+        
+        if is_apple_silicon and (use_native_env or os.getenv("YUKIO_DISABLE_DIA", "").lower() in ("1", "true", "yes")):
+            self.use_native_tts = True
+            self.is_loaded = True  # Native TTS is always "available"
+            logger.info("🍎 Using macOS native TTS for speed on Apple Silicon")
+            logger.info("   Set YUKIO_DISABLE_DIA=1 to use native TTS, or YUKIO_USE_NATIVE_TTS=1")
+        else:
+            # Create cache directory if caching is enabled
+            if self.enable_cache:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                self._load_cache_index()
 
-        # Try to load the model
-        self._load_model()
+            # Try to load the model
+            self._load_model()
 
     def _load_model(self) -> None:
         """
@@ -112,23 +126,44 @@ class TTSManager:
 
             logger.info(f"Loading Dia model: {self.model_name}")
 
-            # Determine device (prioritize GPU: CUDA > CPU > MPS)
-            # Note: MPS has limitations with Dia model (65536 channel limit), so we prefer CPU on Mac
+            # Determine device - force CPU on Apple Silicon for reliability
             import torch
+            import platform
+
             if self.device is None:
                 if torch.cuda.is_available():
                     self.device = "cuda"
                     logger.info("Using CUDA for TTS")
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    # MPS has issues with Dia model - use CPU instead for reliability
-                    self.device = "cpu"
-                    logger.info("MPS available but using CPU for TTS (MPS has limitations with Dia model)")
                 else:
+                    # Force CPU for Apple Silicon (MPS has 65536 channel limit)
                     self.device = "cpu"
-                    logger.info("Using CPU for TTS")
+                    is_apple_silicon = platform.machine() == "arm64" and platform.system() == "Darwin"
+                    if is_apple_silicon:
+                        logger.info("Apple Silicon detected - using CPU for TTS (MPS not supported by Dia)")
+                    else:
+                        logger.info("Using CPU for TTS")
 
             # Load model
             # Note: Dia.from_pretrained accepts device as torch.device or None
+            # Use float32 for CPU (better compatibility than float16)
+            if self.device == "cpu" and self.compute_dtype == "float16":
+                logger.info("Switching to float32 for better CPU compatibility")
+                self.compute_dtype = "float32"
+
+            # Warn M1/M2 users about slow CPU generation
+            is_apple_silicon = platform.machine() == "arm64" and platform.system() == "Darwin"
+            if is_apple_silicon:
+                logger.warning("=" * 70)
+                logger.warning("⚠️  APPLE SILICON (M1/M2) DETECTED")
+                logger.warning("Dia TTS is NOT optimized for Apple Silicon and will be VERY SLOW on CPU.")
+                logger.warning("Generation may take 2-5 minutes per short response.")
+                logger.warning("")
+                logger.warning("Recommendations:")
+                logger.warning("  1. Disable voice with --no-voice flag")
+                logger.warning("  2. Use text-only mode for faster responses")
+                logger.warning("  3. Consider MLX-Audio for M1-optimized TTS (future)")
+                logger.warning("=" * 70)
+
             device_obj = torch.device(self.device) if self.device else None
             self.model = Dia.from_pretrained(
                 self.model_name,
@@ -159,6 +194,8 @@ class TTSManager:
         Returns:
             True if the model is loaded and ready, False otherwise
         """
+        if self.use_native_tts:
+            return True  # Native TTS is always available on macOS
         return self.is_loaded and self.model is not None
 
     def _load_cache_index(self) -> None:
@@ -249,6 +286,80 @@ class TTSManager:
         except Exception as e:
             logger.warning(f"Failed to cache audio: {e}")
 
+    def _speak_native(self, text: str, output_path: Optional[str] = None) -> Optional[np.ndarray]:
+        """
+        Use macOS 'say' command for fast TTS on Apple Silicon.
+        
+        This is much faster than Dia on M1/M2 Macs but has lower quality.
+        Uses the Japanese voice 'Kyoko' if available, otherwise default voice.
+        
+        Args:
+            text: Text to convert to speech
+            output_path: Optional path to save audio file
+            
+        Returns:
+            Audio array (numpy) or None if generation failed
+        """
+        if platform.system() != "Darwin":
+            logger.warning("Native TTS only available on macOS")
+            return None
+        
+        try:
+            # Use temporary file if no output path provided
+            if output_path is None:
+                output_path = tempfile.mktemp(suffix=".aiff")
+            
+            # Try Japanese voice first, fallback to default
+            voices = ["Kyoko", "Otoya"]  # Japanese voices on macOS
+            voice_used = None
+            
+            for voice in voices:
+                try:
+                    # Test if voice is available
+                    # Use 44100 Hz to match API expectations
+                    subprocess.run(
+                        ["say", "-v", voice, "--data-format=LEF32@44100", "-o", output_path, text],
+                        check=True,
+                        capture_output=True,
+                        timeout=30
+                    )
+                    voice_used = voice
+                    break
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+                    continue
+            
+            if voice_used is None:
+                # Fallback to default voice
+                # Use 44100 Hz to match API expectations
+                subprocess.run(
+                    ["say", "--data-format=LEF32@44100", "-o", output_path, text],
+                    check=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                voice_used = "default"
+            
+            logger.debug(f"Generated speech using macOS native TTS (voice: {voice_used})")
+            
+            # Load audio file and convert to numpy array
+            try:
+                import soundfile as sf
+                audio, sample_rate = sf.read(output_path)
+                # Ensure audio is in the correct format (mono, float32)
+                if len(audio.shape) > 1:
+                    audio = audio[:, 0]  # Take first channel if stereo
+                return audio.astype(np.float32)
+            except ImportError:
+                logger.warning("soundfile not available - install with: pip install soundfile")
+                return None
+            except Exception as e:
+                logger.error(f"Failed to load native TTS audio: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Native TTS generation failed: {e}")
+            return None
+
     def generate_speech(
         self,
         text: str,
@@ -294,6 +405,10 @@ class TTSManager:
         if not self.is_available():
             logger.warning("TTS not available - cannot generate speech")
             return None
+        
+        # Use native TTS if enabled (much faster on Apple Silicon)
+        if self.use_native_tts:
+            return self._speak_native(text)
 
         # Check cache first
         if use_cache:
@@ -311,14 +426,22 @@ class TTSManager:
         try:
             if verbose:
                 logger.info(f"Generating speech for: {text[:50]}...")
+                logger.info(f"Device: {self.device}, Dtype: {self.compute_dtype}, Max tokens: {max_tokens}")
 
-            # Limit max_tokens for reasonable generation time
-            # CPU is slower but more reliable than MPS for Dia model
-            # Limit to ~800 tokens for faster generation (roughly 15-20 seconds of audio)
-            if max_tokens is None or max_tokens > 800:
-                max_tokens = 800
+            # Reduce tokens significantly for Apple Silicon M1/M2
+            import platform
+            is_apple_silicon = platform.machine() == "arm64" and platform.system() == "Darwin"
+
+            if is_apple_silicon:
+                # M1/M2: Very conservative limit for reliable generation
+                default_max = 300  # ~5-7 seconds of audio
+            else:
+                default_max = 800  # ~15-20 seconds of audio
+
+            if max_tokens is None or max_tokens > default_max:
+                max_tokens = default_max
                 if verbose:
-                    logger.info(f"Limiting max_tokens to {max_tokens} for faster generation")
+                    logger.info(f"Limiting max_tokens to {max_tokens} for {'Apple Silicon' if is_apple_silicon else 'CPU'}")
 
             # Generate audio with error handling for MPS
             try:
@@ -471,9 +594,9 @@ class TTSManager:
         try:
             kks = pykakasi.kakasi()
             result = kks.convert(japanese_text)
-            # The result is a list of dicts, e.g., [{'orig': '日本語', 'hira': 'にほんご', 'kana': 'ニホンゴ', 'romaji': 'nihongo'}]
-            # We join the 'romaji' parts with spaces for better pronunciation by the TTS model.
-            romaji_text = " ".join([item['romaji'] for item in result])
+            # The result is a list of dicts, e.g., [{'orig': '日本語', 'hira': 'にほんご', 'kana': 'ニホンゴ', 'hepburn': 'nihongo'}]
+            # We join the 'hepburn' (Hepburn romanization) parts with spaces for better pronunciation by the TTS model.
+            romaji_text = " ".join([item['hepburn'] for item in result])
             return f"[{speaker}] {romaji_text}"
         except Exception as e:
             logger.error(f"Failed to convert Japanese text to Romaji: {e}")

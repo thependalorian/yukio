@@ -110,10 +110,27 @@ tts.save_audio("dialogue.wav", audio)
 - **Performance**: Generation is **significantly slower** than real-time. A short phrase can take several minutes. It is not recommended for interactive use but is fine for testing or offline generation.
 
 ### Apple Silicon (Mac M1/M2/M3)
-- **Current Status**: **Very Slow**.
-- **Problem**: The MPS (Metal Performance Shaders) backend has limitations that cause very slow performance (e.g., 5+ minutes for a 30-second audio clip).
-- **Workaround**: The `TTSManager` automatically detects MPS and falls back to the CPU, but it remains slow.
-- **Recommendation**: For now, it is recommended to **not** use the `--voice` flag on Apple Silicon Macs unless you are prepared to wait.
+- **Current Status**: **NOT RECOMMENDED - Extremely Slow**.
+- **Problem**:
+  - The MPS (Metal Performance Shaders) backend has a 65536 output channel limitation that breaks audio generation models.
+  - Dia TTS is designed for CUDA and is not optimized for Apple Silicon.
+  - CPU fallback results in generation times of **2-5 minutes** for short responses (10-15 words).
+  - Even with aggressive optimizations (float32, reduced tokens to 300), generation remains impractically slow.
+
+- **Technical Details**:
+  - The system automatically detects Apple Silicon and:
+    - Forces CPU device (MPS is incompatible)
+    - Switches to float32 for better CPU compatibility
+    - Reduces max_tokens to 300 (~5-7 seconds of audio)
+    - Sets `PYTORCH_ENABLE_MPS_FALLBACK=1` environment variable
+
+- **Recommendation**:
+  - **Disable voice** with `python cli.py` (no `--voice` flag)
+  - Use text-only mode for fast, responsive tutoring
+  - For voice on Mac, consider:
+    - Using a cloud GPU service
+    - Waiting for MLX-Audio integration (Apple Silicon optimized TTS, 40% faster)
+    - Using an external NVIDIA GPU via eGPU (not officially supported)
 
 ## 5. Troubleshooting
 
@@ -126,8 +143,24 @@ tts.save_audio("dialogue.wav", audio)
   - Close other GPU-intensive applications.
   - The system should fall back to CPU automatically.
 
+- **No Audio Output on Mac M1/M2**:
+  - **Symptom**: CLI shows "🔊 Generating voice..." but never completes, or takes 5+ minutes for short text.
+  - **Root Cause**: Dia TTS is incompatible with Apple Silicon MPS and extremely slow on CPU.
+  - **Solution**: Disable voice mode and use text-only:
+    ```bash
+    python cli.py  # No --voice flag
+    ```
+  - **Why This Happens**:
+    - MPS has a 65536 channel limit that breaks Dia's architecture
+    - CPU generation on M1 is 100-200x slower than NVIDIA GPU
+    - Even with max_tokens reduced to 300, generation takes 2-5 minutes
+  - **Future Options**:
+    - MLX-Audio (Apple Silicon native TTS, coming soon)
+    - Cloud GPU services (AWS, Google Cloud with NVIDIA GPUs)
+
 - **Slow Generation on Mac**:
-  - This is expected due to the performance issues with Apple Silicon noted above. There is currently no fix other than using a different machine with an NVIDIA GPU.
+  - This is expected and unavoidable with current Dia model on Apple Silicon.
+  - Use text-only mode for better experience: `python cli.py` (without `--voice`)
 
 - **Model Download Fails**:
   - Check your internet connection.

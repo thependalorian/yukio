@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from datetime import datetime
 import uuid
 
@@ -27,7 +27,8 @@ from .db_utils import (
     get_session,
     add_message,
     get_session_messages,
-    test_connection
+    test_connection,
+    db_manager
 )
 from .models import (
     ChatRequest,
@@ -37,7 +38,13 @@ from .models import (
     StreamDelta,
     ErrorResponse,
     HealthStatus,
-    ToolCall
+    ToolCall,
+    UserProgress,
+    ProgressRecord,
+    Lesson,
+    VocabWord,
+    QuizQuestion,
+    VoicePhrase
 )
 from .tools import (
     vector_search_tool,
@@ -47,6 +54,10 @@ from .tools import (
     HybridSearchInput,
     DocumentListInput
 )
+from .tts import TTSManager
+from fastapi.responses import Response
+import io
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -56,8 +67,11 @@ logger = logging.getLogger(__name__)
 # Application configuration
 APP_ENV = os.getenv("APP_ENV", "development")
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", 8000))
+APP_PORT = int(os.getenv("APP_PORT", 8058))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# Global TTS manager (initialized in lifespan)
+tts_manager: Optional[TTSManager] = None
 
 # Configure logging
 logging.basicConfig(
@@ -80,6 +94,22 @@ async def lifespan(app: FastAPI):
         # Initialize database connections
         await initialize_database()
         logger.info("Database initialized")
+        
+        # Ensure user progress table exists
+        db_manager.create_user_progress_table()
+        logger.info("User progress table ready")
+        
+        # Initialize TTS manager (optional, won't break if unavailable)
+        global tts_manager
+        try:
+            tts_manager = TTSManager()
+            if tts_manager.is_available():
+                logger.info("TTS (Dia) initialized and available")
+            else:
+                logger.info("TTS (Dia) not available - voice features disabled")
+        except Exception as e:
+            logger.warning(f"TTS initialization failed: {e}")
+            tts_manager = None
         
         # Test connections
         db_ok = await test_connection()
@@ -163,6 +193,55 @@ async def get_conversation_context(
         }
         for msg in messages
     ]
+
+
+def clean_agent_response(response: str) -> str:
+    """
+    Clean agent response to remove raw search results and metadata.
+    
+    Removes common patterns where the LLM includes raw search results,
+    document references, or metadata in the response.
+    
+    Args:
+        response: Raw agent response
+    
+    Returns:
+        Cleaned response without search result references
+    """
+    import re
+    
+    # Patterns to remove (Japanese and English)
+    patterns_to_remove = [
+        # Japanese patterns
+        r'これらのドキュメントの検索結果[は、].*?(?=\n\n|\n[A-Z]|$)',
+        r'以下にいくつか重要な内容を抜粋します[：:].*?(?=\n\n|\n[A-Z]|$)',
+        r'検索結果[は、].*?(?=\n\n|\n[A-Z]|$)',
+        r'ドキュメント.*?から得られます.*?(?=\n\n|\n[A-Z]|$)',
+        r'主に.*?資料から得られます.*?(?=\n\n|\n[A-Z]|$)',
+        # English patterns
+        r'Search results.*?(?=\n\n|\n[A-Z]|$)',
+        r'Based on.*?search.*?results.*?(?=\n\n|\n[A-Z]|$)',
+        r'From the.*?documents.*?(?=\n\n|\n[A-Z]|$)',
+        r'Document.*?sources.*?(?=\n\n|\n[A-Z]|$)',
+        # Metadata patterns
+        r'chunk_id[:\s]+[a-f0-9-]+',
+        r'document_id[:\s]+[a-f0-9-]+',
+        r'score[:\s]+[\d.]+',
+        r'\(Source:.*?\)',
+        r'\[Source:.*?\]',
+    ]
+    
+    cleaned = response
+    for pattern in patterns_to_remove:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    
+    # Remove multiple consecutive newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    # Remove leading/trailing whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
 
 
 def extract_tool_calls(result) -> List[ToolCall]:
@@ -472,12 +551,12 @@ async def chat_stream(request: ChatRequest):
                                     
                                     if isinstance(event, PartStartEvent) and event.part.part_kind == 'text':
                                         delta_content = event.part.content
-                                        yield f"data: {json.dumps({'type': 'text', 'content': delta_content})}\n\n"
+                                        yield f"data: {json.dumps({'type': 'text_delta', 'text': delta_content})}\n\n"
                                         full_response += delta_content
                                         
                                     elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                                         delta_content = event.delta.content_delta
-                                        yield f"data: {json.dumps({'type': 'text', 'content': delta_content})}\n\n"
+                                        yield f"data: {json.dumps({'type': 'text_delta', 'text': delta_content})}\n\n"
                                         full_response += delta_content
                 
                 # Extract tools used from the final result
@@ -496,11 +575,14 @@ async def chat_stream(request: ChatRequest):
                     ]
                     yield f"data: {json.dumps({'type': 'tools', 'tools': tools_data})}\n\n"
                 
+                # Clean response - remove any raw search result references
+                cleaned_response = clean_agent_response(full_response)
+                
                 # Save assistant response
                 await add_message(
                     session_id=session_id,
                     role="assistant",
-                    content=full_response,
+                    content=cleaned_response,
                     metadata={
                         "streamed": True,
                         "tool_calls": len(tools_used)
@@ -623,6 +705,477 @@ async def get_session_info(session_id: str):
     except Exception as e:
         logger.error(f"Session retrieval failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/progress/{user_id}", response_model=UserProgress)
+async def get_user_progress(user_id: str):
+    """Get user progress statistics."""
+    try:
+        stats = db_manager.get_user_stats(user_id)
+        return UserProgress(**stats)
+    except Exception as e:
+        logger.error(f"Failed to get user progress: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/progress/{user_id}/record")
+async def record_progress(user_id: str, record: ProgressRecord):
+    """Record user progress (lesson completion, vocab learned, etc.)."""
+    try:
+        progress_id = db_manager.record_user_progress(
+            user_id=user_id,
+            progress_type=record.progress_type,
+            item_id=record.item_id,
+            status=record.status,
+            data=record.data,
+            xp_earned=record.xp_earned,
+            crowns=record.crowns
+        )
+        return {"id": progress_id, "status": "recorded"}
+    except Exception as e:
+        logger.error(f"Failed to record progress: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/progress/{user_id}/lessons")
+async def get_user_lessons(user_id: str, progress_type: Optional[str] = None):
+    """Get user's lesson/vocab progress records."""
+    try:
+        records = db_manager.get_user_progress(user_id, progress_type=progress_type)
+        return {"records": records, "total": len(records)}
+    except Exception as e:
+        logger.error(f"Failed to get user lessons: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lessons", response_model=List[Lesson])
+async def get_lessons(
+    category: Optional[str] = None,
+    jlpt: Optional[str] = None,
+    limit: int = 20
+):
+    """
+    Generate lessons from ingested Japanese learning materials.
+    Uses RAG to search the knowledge base and LLM to structure lessons.
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        deps = AgentDependencies(session_id=session_id)
+        
+        # Build query based on filters
+        query_parts = []
+        if category:
+            query_parts.append(f"{category} lessons")
+        if jlpt:
+            query_parts.append(f"JLPT {jlpt}")
+        if not query_parts:
+            query_parts.append("Japanese language lessons")
+        
+        query = " ".join(query_parts)
+        
+        # Use agent to generate structured lessons from RAG data
+        prompt = f"""Generate a list of {limit} structured Japanese lessons from the learning materials.
+        
+Requirements:
+- Each lesson should have: title, titleJP (Japanese title), description, xp (10-30), crowns (0-5), jlpt level, category
+- Categories: hiragana, katakana, kanji, grammar, vocabulary
+- JLPT levels: N5, N4, N3, N2, N1
+- Status should be "available" for all
+- Search the knowledge base for relevant content
+- Return as JSON array of lesson objects
+
+Query: {query}
+Category filter: {category or 'all'}
+JLPT filter: {jlpt or 'all'}
+"""
+        
+        result = await rag_agent.run(prompt, deps=deps)
+        
+        # Parse LLM response (should be JSON)
+        try:
+            # Try to extract JSON from response
+            response_text = result.output
+            # Look for JSON array in response
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']') + 1
+            if json_start >= 0 and json_end > json_start:
+                lessons_data = json.loads(response_text[json_start:json_end])
+            else:
+                # Fallback: try parsing entire response
+                lessons_data = json.loads(response_text)
+            
+            # Convert to Lesson models
+            lessons = []
+            for i, lesson_data in enumerate(lessons_data[:limit]):
+                lesson = Lesson(
+                    id=str(uuid.uuid4()),
+                    title=lesson_data.get("title", f"Lesson {i+1}"),
+                    titleJP=lesson_data.get("titleJP"),
+                    description=lesson_data.get("description", ""),
+                    xp=lesson_data.get("xp", 15),
+                    crowns=lesson_data.get("crowns", 0),
+                    status="available",
+                    jlpt=lesson_data.get("jlpt", "N5"),
+                    category=lesson_data.get("category", "grammar")
+                )
+                lessons.append(lesson)
+            
+            return lessons
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse lesson JSON: {e}")
+            logger.error(f"LLM response: {result.output[:500]}")
+            # Return empty list if parsing fails
+            return []
+        
+    except Exception as e:
+        logger.error(f"Failed to generate lessons: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/vocabulary", response_model=List[VocabWord])
+async def get_vocabulary(
+    jlpt: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Extract vocabulary words from ingested Japanese learning materials.
+    Uses RAG to find vocabulary and LLM to structure it.
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        deps = AgentDependencies(session_id=session_id)
+        
+        query = f"Japanese vocabulary words"
+        if jlpt:
+            query += f" JLPT {jlpt}"
+        
+        prompt = f"""Extract {limit} Japanese vocabulary words from the learning materials.
+
+For each word, provide:
+- japanese: The word in Japanese (kanji/hiragana/katakana)
+- reading: Hiragana reading
+- romaji: Hepburn romanization
+- english: English meaning
+- example: Example sentence (optional)
+- exampleReading: Hiragana reading of example (optional)
+- exampleTranslation: English translation of example (optional)
+- jlpt: JLPT level (N5-N1)
+
+Search the knowledge base for vocabulary content.
+Return as JSON array of vocabulary objects.
+
+Query: {query}
+JLPT filter: {jlpt or 'all'}
+"""
+        
+        result = await rag_agent.run(prompt, deps=deps)
+        
+        import json
+        try:
+            response_text = result.output
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']') + 1
+            if json_start >= 0 and json_end > json_start:
+                vocab_data = json.loads(response_text[json_start:json_end])
+            else:
+                vocab_data = json.loads(response_text)
+            
+            vocab_words = []
+            for i, word_data in enumerate(vocab_data[:limit]):
+                word = VocabWord(
+                    id=str(uuid.uuid4()),
+                    japanese=word_data.get("japanese", ""),
+                    reading=word_data.get("reading", ""),
+                    romaji=word_data.get("romaji", ""),
+                    english=word_data.get("english", ""),
+                    example=word_data.get("example"),
+                    exampleReading=word_data.get("exampleReading"),
+                    exampleTranslation=word_data.get("exampleTranslation"),
+                    jlpt=word_data.get("jlpt", "N5")
+                )
+                vocab_words.append(word)
+            
+            return vocab_words
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse vocabulary JSON: {e}")
+            return []
+        
+    except Exception as e:
+        logger.error(f"Failed to generate vocabulary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/questions", response_model=List[QuizQuestion])
+async def get_quiz_questions(
+    lesson_id: Optional[str] = None,
+    jlpt: Optional[str] = None,
+    limit: int = 10
+):
+    """
+    Generate quiz questions from ingested Japanese learning materials.
+    Uses RAG to find relevant content and LLM to create questions.
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        deps = AgentDependencies(session_id=session_id)
+        
+        query = "Japanese language quiz questions"
+        if jlpt:
+            query += f" JLPT {jlpt}"
+        
+        prompt = f"""Generate {limit} quiz questions for Japanese language learning.
+
+Question types:
+- multiple-choice: 4 options, one correct answer
+- type-answer: User types Japanese answer
+- match: Matching exercise
+- listen: Audio-based question
+
+For each question, provide:
+- type: Question type
+- question: Question in English
+- questionJP: Question in Japanese (optional)
+- options: Array of options (for multiple-choice/listen)
+- correctAnswer: The correct answer
+- explanation: Explanation of the answer
+
+Search the knowledge base for relevant content.
+Return as JSON array of question objects.
+
+Query: {query}
+JLPT filter: {jlpt or 'all'}
+"""
+        
+        result = await rag_agent.run(prompt, deps=deps)
+        
+        import json
+        try:
+            response_text = result.output
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']') + 1
+            if json_start >= 0 and json_end > json_start:
+                questions_data = json.loads(response_text[json_start:json_end])
+            else:
+                questions_data = json.loads(response_text)
+            
+            questions = []
+            for i, q_data in enumerate(questions_data[:limit]):
+                question = QuizQuestion(
+                    id=str(uuid.uuid4()),
+                    type=q_data.get("type", "multiple-choice"),
+                    question=q_data.get("question", ""),
+                    questionJP=q_data.get("questionJP"),
+                    options=q_data.get("options"),
+                    correctAnswer=q_data.get("correctAnswer", ""),
+                    explanation=q_data.get("explanation"),
+                    audioUrl=q_data.get("audioUrl")
+                )
+                questions.append(question)
+            
+            return questions
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse quiz JSON: {e}")
+            return []
+        
+    except Exception as e:
+        logger.error(f"Failed to generate quiz questions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/voice/phrases", response_model=List[VoicePhrase])
+async def get_voice_phrases(
+    difficulty: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 20
+):
+    """
+    Generate voice practice phrases from ingested Japanese learning materials.
+    Uses RAG to find phrases suitable for pronunciation practice.
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        deps = AgentDependencies(session_id=session_id)
+        
+        query = "Japanese phrases for pronunciation practice"
+        if category:
+            query += f" {category}"
+        
+        prompt = f"""Extract {limit} Japanese phrases suitable for voice/pronunciation practice.
+
+For each phrase, provide:
+- japanese: Phrase in Japanese
+- romaji: Hepburn romanization
+- english: English translation
+- difficulty: easy, medium, or hard
+- category: Category (Greetings, Politeness, Questions, etc.)
+
+Search the knowledge base for common Japanese phrases.
+Return as JSON array of phrase objects.
+
+Query: {query}
+Difficulty filter: {difficulty or 'all'}
+Category filter: {category or 'all'}
+"""
+        
+        result = await rag_agent.run(prompt, deps=deps)
+        
+        import json
+        try:
+            response_text = result.output
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']') + 1
+            if json_start >= 0 and json_end > json_start:
+                phrases_data = json.loads(response_text[json_start:json_end])
+            else:
+                phrases_data = json.loads(response_text)
+            
+            phrases = []
+            for i, p_data in enumerate(phrases_data[:limit]):
+                phrase = VoicePhrase(
+                    id=str(uuid.uuid4()),
+                    japanese=p_data.get("japanese", ""),
+                    romaji=p_data.get("romaji", ""),
+                    english=p_data.get("english", ""),
+                    difficulty=p_data.get("difficulty", "easy"),
+                    category=p_data.get("category", "Common Phrases")
+                )
+                phrases.append(phrase)
+            
+            return phrases
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse phrases JSON: {e}")
+            return []
+        
+    except Exception as e:
+        logger.error(f"Failed to generate voice phrases: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/progress/{user_id}/stats")
+async def get_progress_stats(user_id: str):
+    """
+    Get user progress statistics including weekly data and vocabulary mastery.
+    """
+    try:
+        # Get user progress records
+        records = db_manager.get_user_progress(user_id)
+        
+        # Generate weekly activity data (last 7 days)
+        from datetime import datetime, timedelta
+        weekly_data = []
+        days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        today = datetime.now()
+        
+        for i in range(7):
+            day_date = today - timedelta(days=6-i)
+            day_name = days[day_date.weekday()]
+            
+            # Calculate XP and time for this day (simplified - would need timestamp tracking)
+            day_records = [r for r in records if r.get("created_at", "").startswith(day_date.strftime("%Y-%m-%d"))]
+            xp = sum(r.get("xp_earned", 0) for r in day_records)
+            time = len(day_records) * 5  # Estimate 5 min per activity
+            
+            weekly_data.append({
+                "day": day_name,
+                "xp": xp,
+                "time": time
+            })
+        
+        # Generate vocabulary mastery stats by JLPT level
+        vocab_records = [r for r in records if r.get("type") == "vocab"]
+        vocab_stats = []
+        jlpt_levels = ["N5", "N4", "N3"]
+        
+        for level in jlpt_levels:
+            level_vocab = [r for r in vocab_records if r.get("data", {}).get("jlpt") == level]
+            learned = len(level_vocab)
+            mastered = len([r for r in level_vocab if r.get("status") == "mastered"])
+            reviewing = len([r for r in level_vocab if r.get("status") == "in_progress"])
+            
+            vocab_stats.append({
+                "category": level,
+                "learned": learned,
+                "mastered": mastered,
+                "reviewing": reviewing
+            })
+        
+        return {
+            "weekly": weekly_data,
+            "vocab": vocab_stats
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get progress stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/tts")
+async def text_to_speech(request: Dict[str, Any]):
+    """
+    Generate speech from text using Dia TTS.
+    
+    Request body:
+        {
+            "text": "Text to convert to speech"
+        }
+    
+    Returns:
+        Audio file (WAV format) as binary response
+    """
+    global tts_manager
+    
+    if tts_manager is None or not tts_manager.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="TTS service not available. Dia TTS is not installed or failed to load."
+        )
+    
+    try:
+        text = request.get("text", "")
+        if not text:
+            raise HTTPException(status_code=400, detail="Text parameter is required")
+        
+        logger.info(f"Generating TTS for text: {text[:50]}...")
+        
+        # Format Japanese text to Romaji if needed
+        formatted_text = tts_manager.format_japanese_text(text)
+        
+        # Generate speech
+        audio_array = tts_manager.generate_speech(
+            formatted_text,
+            max_tokens=300,  # Conservative limit for reliability
+            verbose=False
+        )
+        
+        if audio_array is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate speech. The text may be too long or TTS encountered an error."
+            )
+        
+        # Convert numpy array to WAV bytes
+        import soundfile as sf
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, audio_array, 44100, format='WAV')
+        wav_bytes = wav_buffer.getvalue()
+        
+        logger.info(f"Generated TTS audio: {len(wav_bytes)} bytes")
+        
+        # Return audio as WAV file
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=speech.wav",
+                "Content-Length": str(len(wav_bytes))
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"TTS generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
 
 # Exception handlers

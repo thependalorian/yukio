@@ -27,6 +27,8 @@ jobs:
         uv venv
         source .venv/bin/activate
         uv pip install -e .[dev] -e dia
+        # Install optional dependencies (may have conflicts, but that's OK)
+        uv pip install mem0ai || echo "mem0ai installation failed (optional)"
 
     - name: Lint with ruff
       run: |
