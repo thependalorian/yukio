@@ -1,0 +1,147 @@
+{
+  "total": 10,
+  "passed": 10,
+  "failed": 0,
+  "results": [
+    {
+      "name": "Environment Variables",
+      "passed": true,
+      "message": "All required environment variables are set",
+      "details": {
+        "llm_provider": "ollama",
+        "llm_model": "qwen2.5:14b-instruct",
+        "embedding_model": "nomic-embed-text",
+        "embedding_dimensions": "768"
+      }
+    },
+    {
+      "name": "Ollama Installation",
+      "passed": true,
+      "message": "Ollama found at: /usr/local/bin/ollama",
+      "details": {}
+    },
+    {
+      "name": "Ollama Service",
+      "passed": true,
+      "message": "All required models are available",
+      "details": {
+        "available_models": [
+          "deepseek-ocr:latest",
+          "qwen2.5:14b-instruct",
+          "nomic-embed-text:latest",
+          "llama3.2:latest",
+          "qwen2.5:7b",
+          "mxbai-embed-large:latest",
+          "codellama:latest"
+        ],
+        "required_models": [
+          "qwen2.5:14b-instruct",
+          "nomic-embed-text"
+        ]
+      }
+    },
+    {
+      "name": "Python Dependencies",
+      "passed": true,
+      "message": "All required packages are installed",
+      "details": {
+        "packages": [
+          [
+            "pydantic_ai",
+            "pydantic_ai"
+          ],
+          [
+            "lancedb",
+            "lancedb"
+          ],
+          [
+            "openai",
+            "openai"
+          ],
+          [
+            "python-dotenv",
+            "dotenv"
+          ],
+          [
+            "fastapi",
+            "fastapi"
+          ],
+          [
+            "uvicorn",
+            "uvicorn"
+          ],
+          [
+            "requests",
+            "requests"
+          ],
+          [
+            "aiohttp",
+            "aiohttp"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "LanceDB Setup",
+      "passed": true,
+      "message": "Database initialized successfully (no data ingested yet)",
+      "details": {
+        "total_chunks": 0,
+        "total_documents": 0,
+        "db_path": "",
+        "tables": []
+      }
+    },
+    {
+      "name": "Markdown Files",
+      "passed": true,
+      "message": "Found 10 markdown files",
+      "details": {
+        "count": 10,
+        "files": [
+          "\u3069\u3093\u3069\u3093\u8a71\u305b\u308b_\u65e5\u672c\u8a9e\u4f1a\u8a71\u30d5\u30ec\u30fc\u30ba\u5927\u7279\u8a13\u5fc5\u9808700 700 Essential Phrases for -- Mizutani Nobuko_ et al. -.md",
+          "Marugoto Japanese Language and Culture Elementary 2 A2 Rikai -- The Japan Founda.md",
+          "Essential Japanese- Speak Japanese with Confidence_ -- Periplus Editors_ -- _ We.md",
+          "Marugoto Japanese Language and Culture Elementary 2 A2 -- The Japan Foundation -.md",
+          "Whole Japanese language and culture Beginner 1 A2 Katsudo -- The Japan Foundatio.md"
+        ],
+        "total_size_mb": 1.5446052551269531
+      }
+    },
+    {
+      "name": "Embedder",
+      "passed": true,
+      "message": "Embedder working (dimension: 768)",
+      "details": {
+        "model": "nomic-embed-text",
+        "dimension": 768
+      }
+    },
+    {
+      "name": "Chunker",
+      "passed": true,
+      "message": "Chunker working (1 chunks created)",
+      "details": {
+        "chunk_count": 1,
+        "avg_chunk_size": 98.0
+      }
+    },
+    {
+      "name": "Agent Initialization",
+      "passed": true,
+      "message": "Agent initialized successfully",
+      "details": {
+        "model": "OpenAIChatModel()"
+      }
+    },
+    {
+      "name": "API Module",
+      "passed": true,
+      "message": "FastAPI app can be imported",
+      "details": {
+        "title": "Yukio Japanese Tutor API",
+        "version": "0.1.0"
+      }
+    }
+  ]
+}
