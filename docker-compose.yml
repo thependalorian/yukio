@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8058:8058"
+    volumes:
+      # Mount the application code for development
+      - .:/app
+      # Persist yukio's data (lancedb, tts_cache, etc.)
+      - yukio_data:/app/yukio_data
+    env_file:
+      - .env
+    environment:
+      # Ensure Ollama is accessible from the app container
+      - LLM_BASE_URL=http://ollama:11434/v1
+      - EMBEDDING_BASE_URL=http://ollama:11434/v1
+    depends_on:
+      - ollama
+    # Use --reload for development to automatically apply code changes
+    command: uvicorn agent.api:app --host 0.0.0.0 --port 8058 --reload
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # tty: true # Keep the container running
+
+volumes:
+  yukio_data:
+  ollama_data:

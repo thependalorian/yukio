@@ -1,0 +1,29 @@
+# Git
+.git
+.github
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Python
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / Editor
+.DS_Store
+*.swo
+*.swp
+*.bak
+
+# Data and backups
+yukio_data/
+*.backup
+
+# Node modules (if any frontend is added later)
+node_modules/
