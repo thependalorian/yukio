@@ -8,7 +8,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import uuid
 
@@ -59,6 +59,12 @@ from .models import (
     VocabWord,
     QuizQuestion,
     VoicePhrase,
+    PronunciationAnalysisRequest,
+    PronunciationAnalysisResponse,
+    Achievement,
+    UserAchievement,
+    LeaderboardEntry,
+    LeaderboardCategory,
     RirekishoRequest,
     RirekishoResponse,
     RirekishoSection,
@@ -73,8 +79,11 @@ from .tools import (
     DocumentListInput
 )
 from .tts import TTSManager
+from .stt import STTManager
+from .gamification import GamificationService
 from .security import validate_and_sanitize_message, detect_prompt_injection
 from fastapi.responses import Response
+from fastapi import UploadFile, File, Form
 import io
 import numpy as np
 
@@ -91,6 +100,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Global TTS manager (initialized in lifespan)
 tts_manager: Optional[TTSManager] = None
+
+# Global STT manager (initialized in lifespan)
+stt_manager: Optional[STTManager] = None
+
+# Global gamification service
+gamification_service: Optional[GamificationService] = None
 
 # Configure logging
 logging.basicConfig(
@@ -145,6 +160,30 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"TTS initialization failed: {e}")
             tts_manager = None
+        
+        # Initialize STT manager (optional, won't break if unavailable)
+        global stt_manager
+        try:
+            whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "base")  # "tiny", "base", "small", "medium", "large"
+            stt_manager = STTManager(model_size=whisper_model_size, language="ja")
+            
+            if stt_manager.is_available():
+                logger.info(f"STT (Whisper {whisper_model_size}) initialized and available")
+            else:
+                logger.info("STT not available - pronunciation analysis disabled")
+        except Exception as e:
+            logger.warning(f"STT initialization failed: {e}")
+            stt_manager = None
+        
+        # Initialize gamification service
+        global gamification_service
+        try:
+            from .db_utils import db_manager
+            gamification_service = GamificationService(db_manager=db_manager)
+            logger.info("Gamification service initialized")
+        except Exception as e:
+            logger.warning(f"Gamification service initialization failed: {e}")
+            gamification_service = None
         
         # Test connections
         db_ok = await test_connection()
@@ -1072,7 +1111,95 @@ async def record_progress(user_id: str, record: ProgressRecord):
             xp_earned=record.xp_earned,
             crowns=record.crowns
         )
-        return {"id": progress_id, "status": "recorded"}
+        
+        # Check for achievements after recording progress
+        newly_unlocked = []
+        if gamification_service:
+            try:
+                # Get user's progress records
+                progress_records = db_manager.get_user_progress(user_id)
+                
+                # Calculate progress data
+                progress_data = gamification_service.calculate_progress_data(
+                    user_id, progress_records
+                )
+                
+                # Get already unlocked achievements
+                unlocked_achievements = db_manager.get_user_achievements(user_id)
+                
+                # Check for new achievements
+                new_achievements = gamification_service.check_achievements(
+                    user_id, progress_data, unlocked_achievements
+                )
+                
+                # Unlock new achievements and award XP
+                for ach_data in new_achievements:
+                    achievement = ach_data["achievement"]
+                    db_manager.unlock_achievement(
+                        user_id,
+                        achievement["id"],
+                        progress={"unlocked_at": ach_data["unlocked_at"]}
+                    )
+                    
+                    # Award XP for achievement
+                    if ach_data["xp_reward"] > 0:
+                        db_manager.record_user_progress(
+                            user_id=user_id,
+                            progress_type="achievement",
+                            item_id=achievement["id"],
+                            status="completed",
+                            data={"achievement_name": achievement["name"]},
+                            xp_earned=ach_data["xp_reward"],
+                            crowns=0
+                        )
+                    
+                    newly_unlocked.append({
+                        "id": achievement["id"],
+                        "name": achievement["name"],
+                        "description": achievement["description"],
+                        "icon": achievement["icon"],
+                        "xp_reward": ach_data["xp_reward"]
+                    })
+                
+                if newly_unlocked:
+                    logger.info(f"Unlocked {len(newly_unlocked)} achievements for user {user_id}")
+                    
+                    # Update leaderboards when achievements are unlocked
+                    try:
+                        user_stats = db_manager.get_user_stats(user_id)
+                        total_xp = user_stats.get("xp", 0)
+                        streak = user_stats.get("streak", 0)
+                        lessons = user_stats.get("lessons_completed", 0)
+                        
+                        # Update weekly XP leaderboard
+                        now = datetime.now(timezone.utc)
+                        year, week, _ = now.isocalendar()
+                        period_id = f"{year}-W{week:02d}"
+                        db_manager.update_leaderboard(user_id, "weekly_xp", total_xp, period_id)
+                        
+                        # Update monthly XP leaderboard
+                        month_period = f"{now.year}-{now.month:02d}"
+                        db_manager.update_leaderboard(user_id, "monthly_xp", total_xp, month_period)
+                        
+                        # Update all-time XP leaderboard
+                        db_manager.update_leaderboard(user_id, "all_time_xp", total_xp, "all-time")
+                        
+                        # Update streak leaderboards
+                        db_manager.update_leaderboard(user_id, "weekly_streak", streak, period_id)
+                        db_manager.update_leaderboard(user_id, "monthly_streak", streak, month_period)
+                        
+                        # Update lessons leaderboard
+                        db_manager.update_leaderboard(user_id, "lessons", lessons, "all-time")
+                    except Exception as leaderboard_error:
+                        logger.warning(f"Leaderboard update failed: {leaderboard_error}")
+            except Exception as ach_error:
+                logger.warning(f"Achievement checking failed: {ach_error}")
+        
+        return {
+            "id": progress_id,
+            "status": "recorded",
+            "achievements_unlocked": newly_unlocked
+        }
     except Exception as e:
         logger.error(f"Failed to record progress: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1389,6 +1516,275 @@ Category filter: {category or 'all'}
         
     except Exception as e:
         logger.error(f"Failed to generate voice phrases: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/voice/analyze", response_model=PronunciationAnalysisResponse)
+async def analyze_pronunciation(
+    audio: UploadFile = File(..., description="Audio file (WAV, MP3, M4A, etc.)"),
+    target_text: str = Form(..., description="Target Japanese text"),
+    target_romaji: Optional[str] = Form(None, description="Target romaji (optional)")
+):
+    """
+    Analyze pronunciation of recorded audio.
+    
+    This endpoint:
+    1. Transcribes the audio using Whisper STT
+    2. Compares transcription with target text
+    3. Calculates pronunciation score (0-100)
+    4. Provides detailed feedback
+    
+    Args:
+        audio: Audio file uploaded by user
+        target_text: Target Japanese text to compare against
+        target_romaji: Target romaji (optional, will be generated if not provided)
+    
+    Returns:
+        PronunciationAnalysisResponse with transcript, score, and feedback
+    """
+    if not stt_manager or not stt_manager.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="STT not available. Install Whisper: pip install openai-whisper"
+        )
+    
+    try:
+        # Save uploaded file temporarily
+        import tempfile
+        import shutil
+        
+        # Create temp file with appropriate extension
+        file_ext = Path(audio.filename).suffix if audio.filename else ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
+            tmp_path = tmp_file.name
+            # Copy uploaded file content
+            shutil.copyfileobj(audio.file, tmp_file)
+        
+        try:
+            # Analyze pronunciation
+            result = stt_manager.analyze_pronunciation(
+                audio_path=tmp_path,
+                target_text=target_text,
+                target_romaji=target_romaji
+            )
+            
+            logger.info(f"Pronunciation analysis: {result['score']}% for '{target_text}'")
+            
+            # Record pronunciation practice for progress tracking
+            try:
+                pronunciation_data = {
+                    "target_text": target_text,
+                    "target_romaji": result.get("target_romaji", ""),
+                    "transcript": result.get("transcript", ""),
+                    "score": result.get("score", 0),
+                    "feedback": result.get("feedback", "")
+                }
+                
+                # Record as pronunciation progress
+                db_manager.record_user_progress(
+                    user_id="default_user",  # TODO: Get from request/auth
+                    progress_type="pronunciation",
+                    item_id=f"pronunciation_{uuid.uuid4().hex[:8]}",
+                    status="completed",
+                    data=pronunciation_data,
+                    xp_earned=10 if result.get("score", 0) >= 80 else 5,  # XP based on score
+                    crowns=0
+                )
+                
+                # Check for pronunciation achievements
+                newly_unlocked_achievements = []
+                if gamification_service:
+                    try:
+                        # Use the same user_id variable defined above
+                        progress_records = db_manager.get_user_progress(user_id)
+                        progress_data = gamification_service.calculate_progress_data(
+                            user_id, progress_records
+                        )
+                        unlocked_achievements = db_manager.get_user_achievements(user_id)
+                        
+                        new_achievements = gamification_service.check_achievements(
+                            user_id, progress_data, unlocked_achievements
+                        )
+                        
+                        # Unlock achievements and award XP
+                        for ach_data in new_achievements:
+                            achievement = ach_data["achievement"]
+                            db_manager.unlock_achievement(
+                                user_id,
+                                achievement["id"],
+                                progress={"unlocked_at": ach_data["unlocked_at"]}
+                            )
+                            
+                            # Award XP for achievement
+                            if ach_data["xp_reward"] > 0:
+                                db_manager.record_user_progress(
+                                    user_id=user_id,
+                                    progress_type="achievement",
+                                    item_id=achievement["id"],
+                                    status="completed",
+                                    data={"achievement_name": achievement["name"]},
+                                    xp_earned=ach_data["xp_reward"],
+                                    crowns=0
+                                )
+                            
+                            newly_unlocked_achievements.append({
+                                "id": achievement["id"],
+                                "name": achievement["name"],
+                                "description": achievement["description"],
+                                "icon": achievement["icon"],
+                                "xp_reward": ach_data["xp_reward"]
+                            })
+                        
+                        if newly_unlocked_achievements:
+                            logger.info(f"Unlocked {len(newly_unlocked_achievements)} achievements for user {user_id}")
+                    except Exception as ach_error:
+                        logger.warning(f"Pronunciation achievement check failed: {ach_error}")
+                
+                # Add achievements to response (frontend can show notifications)
+                if newly_unlocked_achievements:
+                    result["achievements_unlocked"] = newly_unlocked_achievements
+            except Exception as progress_error:
+                logger.warning(f"Failed to record pronunciation progress: {progress_error}")
+            
+            return PronunciationAnalysisResponse(**result)
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {e}")
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"Pronunciation analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@app.get("/achievements", response_model=List[Achievement])
+async def get_all_achievements():
+    """
+    Get all available achievements.
+    
+    Returns:
+        List of all achievement definitions
+    """
+    if not gamification_service:
+        raise HTTPException(status_code=503, detail="Gamification service not available")
+    
+    try:
+        achievements = gamification_service.get_all_achievements()
+        return [Achievement(**ach) for ach in achievements]
+    except Exception as e:
+        logger.error(f"Failed to get achievements: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/achievements/{user_id}", response_model=List[UserAchievement])
+async def get_user_achievements_endpoint(user_id: str):
+    """
+    Get user's unlocked achievements.
+    
+    Args:
+        user_id: User identifier
+    
+    Returns:
+        List of user's achievements
+    """
+    try:
+        unlocked_ids = db_manager.get_user_achievements(user_id)
+        
+        if not gamification_service:
+            return []
+        
+        # Get achievement details
+        user_achievements = []
+        for ach_id in unlocked_ids:
+            achievement = gamification_service.get_achievement(ach_id)
+            if achievement:
+                # Get unlock timestamp from database
+                table = db_manager.db.open_table("user_achievements")
+                entries = table.search().where(
+                    f"user_id = '{user_id}' AND achievement_id = '{ach_id}'"
+                ).to_list()
+                
+                unlocked_at = datetime.now(timezone.utc)
+                if entries:
+                    unlocked_at_str = entries[0].get("unlocked_at", "")
+                    try:
+                        unlocked_at = datetime.fromisoformat(unlocked_at_str.replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                user_achievements.append(UserAchievement(
+                    id=entries[0].get("id", "") if entries else str(uuid.uuid4()),
+                    user_id=user_id,
+                    achievement_id=ach_id,
+                    unlocked_at=unlocked_at,
+                    progress=None
+                ))
+        
+        return user_achievements
+    except Exception as e:
+        logger.error(f"Failed to get user achievements: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/leaderboards/{category}", response_model=List[LeaderboardEntry])
+async def get_leaderboard(
+    category: LeaderboardCategory,
+    period: str = "weekly",
+    limit: int = 100
+):
+    """
+    Get leaderboard entries.
+    
+    Args:
+        category: Leaderboard category
+        period: Period (weekly, monthly, all-time)
+        limit: Maximum number of entries
+    
+    Returns:
+        List of leaderboard entries
+    """
+    try:
+        # Calculate period identifier
+        now = datetime.now(timezone.utc)
+        
+        if period == "weekly":
+            # ISO week format: 2025-W03
+            year, week, _ = now.isocalendar()
+            period_id = f"{year}-W{week:02d}"
+        elif period == "monthly":
+            # Format: 2025-01
+            period_id = f"{now.year}-{now.month:02d}"
+        else:
+            period_id = "all-time"
+        
+        entries = db_manager.get_leaderboard(
+            category=category.value,
+            period=period_id,
+            limit=limit
+        )
+        
+        # Convert to LeaderboardEntry models
+        leaderboard_entries = []
+        for entry in entries:
+            # Get user name
+            user_stats = db_manager.get_user_stats(entry.get("user_id", ""))
+            leaderboard_entries.append(LeaderboardEntry(
+                user_id=entry.get("user_id", ""),
+                user_name=user_stats.get("name", "Anonymous"),
+                score=entry.get("score", 0),
+                rank=entry.get("rank", 0),
+                period=period_id
+            ))
+        
+        return leaderboard_entries
+    except Exception as e:
+        logger.error(f"Failed to get leaderboard: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

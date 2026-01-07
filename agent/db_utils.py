@@ -100,6 +100,70 @@ class LanceDBManager:
         self.db.create_table(self.table_name, schema=schema)
         logger.info(f"Created table {self.table_name} with embedding dimension {embedding_dim}")
 
+    def create_achievements_table(self):
+        """Create achievements table if it doesn't exist."""
+        self._ensure_initialized()
+        
+        table_name = "achievements"
+        if self._table_exists(table_name):
+            return
+        
+        schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("name", pa.string()),
+            pa.field("description", pa.string()),
+            pa.field("icon", pa.string()),
+            pa.field("category", pa.string()),
+            pa.field("rarity", pa.string()),
+            pa.field("criteria", pa.string()),  # JSON string
+            pa.field("xp_reward", pa.int32()),
+            pa.field("created_at", pa.string()),
+        ])
+        
+        self.db.create_table(table_name, schema=schema)
+        logger.info(f"Created {table_name} table")
+    
+    def create_user_achievements_table(self):
+        """Create user_achievements table if it doesn't exist."""
+        self._ensure_initialized()
+        
+        table_name = "user_achievements"
+        if self._table_exists(table_name):
+            return
+        
+        schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("user_id", pa.string()),
+            pa.field("achievement_id", pa.string()),
+            pa.field("unlocked_at", pa.string()),
+            pa.field("progress", pa.string()),  # JSON string
+            pa.field("created_at", pa.string()),
+        ])
+        
+        self.db.create_table(table_name, schema=schema)
+        logger.info(f"Created {table_name} table")
+    
+    def create_leaderboards_table(self):
+        """Create leaderboards table if it doesn't exist."""
+        self._ensure_initialized()
+        
+        table_name = "leaderboards"
+        if self._table_exists(table_name):
+            return
+        
+        schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("user_id", pa.string()),
+            pa.field("category", pa.string()),  # weekly_xp, monthly_xp, etc.
+            pa.field("score", pa.int64()),
+            pa.field("period", pa.string()),  # 2025-W03, 2025-01, all-time
+            pa.field("rank", pa.int32()),
+            pa.field("updated_at", pa.string()),
+        ])
+        
+        self.db.create_table(table_name, schema=schema)
+        logger.info(f"Created {table_name} table")
+    
     def create_user_progress_table(self):
         """
         Create a table for storing user progress, lessons, vocabulary, and XP.
@@ -526,6 +590,175 @@ class LanceDBManager:
             "hearts": 3,  # Default
             "jlpt_level": jlpt_level,
         }
+    
+    def get_user_achievements(self, user_id: str) -> List[str]:
+        """
+        Get list of unlocked achievement IDs for a user.
+        
+        Args:
+            user_id: User identifier
+        
+        Returns:
+            List of achievement IDs
+        """
+        self._ensure_initialized()
+        
+        if not self._table_exists("user_achievements"):
+            return []
+        
+        table = self.db.open_table("user_achievements")
+        results = table.search().where(f"user_id = '{user_id}'").to_list()
+        
+        return [r.get("achievement_id") for r in results]
+    
+    def unlock_achievement(
+        self,
+        user_id: str,
+        achievement_id: str,
+        progress: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Unlock an achievement for a user.
+        
+        Args:
+            user_id: User identifier
+            achievement_id: Achievement ID
+            progress: Optional progress data
+        
+        Returns:
+            User achievement record ID
+        """
+        self._ensure_initialized()
+        self.create_user_achievements_table()
+        
+        # Check if already unlocked
+        existing = self.get_user_achievements(user_id)
+        if achievement_id in existing:
+            logger.debug(f"Achievement {achievement_id} already unlocked for user {user_id}")
+            return ""
+        
+        achievement_id_record = str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        
+        table = self.db.open_table("user_achievements")
+        table.add([{
+            "id": achievement_id_record,
+            "user_id": user_id,
+            "achievement_id": achievement_id,
+            "unlocked_at": now,
+            "progress": json.dumps(progress or {}),
+            "created_at": now,
+        }])
+        
+        logger.info(f"Unlocked achievement {achievement_id} for user {user_id}")
+        return achievement_id_record
+    
+    def update_leaderboard(
+        self,
+        user_id: str,
+        category: str,
+        score: int,
+        period: str
+    ) -> int:
+        """
+        Update leaderboard entry for a user.
+        
+        Args:
+            user_id: User identifier
+            category: Leaderboard category (weekly_xp, monthly_xp, etc.)
+            score: Score to record
+            period: Period identifier (2025-W03, 2025-01, all-time)
+        
+        Returns:
+            Rank of the user
+        """
+        self._ensure_initialized()
+        self.create_leaderboards_table()
+        
+        now = datetime.now(timezone.utc).isoformat()
+        table = self.db.open_table("leaderboards")
+        
+        # Check if entry exists
+        existing = table.search().where(
+            f"user_id = '{user_id}' AND category = '{category}' AND period = '{period}'"
+        ).to_list()
+        
+        if existing:
+            # Update existing entry
+            record_id = existing[0].get("id")
+            table.update({
+                "score": score,
+                "updated_at": now
+            }).where(f"id = '{record_id}'").execute()
+        else:
+            # Create new entry
+            entry_id = str(uuid4())
+            table.add([{
+                "id": entry_id,
+                "user_id": user_id,
+                "category": category,
+                "score": score,
+                "period": period,
+                "rank": 0,  # Will be calculated
+                "updated_at": now,
+            }])
+        
+        # Calculate rank (simplified - would need proper ranking in production)
+        all_entries = table.search().where(
+            f"category = '{category}' AND period = '{period}'"
+        ).to_list()
+        
+        # Sort by score descending
+        sorted_entries = sorted(all_entries, key=lambda x: x.get("score", 0), reverse=True)
+        
+        # Find user's rank
+        rank = 1
+        for entry in sorted_entries:
+            if entry.get("user_id") == user_id:
+                break
+            rank += 1
+        
+        # Update rank
+        if existing:
+            record_id = existing[0].get("id")
+            table.update({"rank": rank}).where(f"id = '{record_id}'").execute()
+        else:
+            entry_id = str(uuid4())
+            table.update({"rank": rank}).where(f"id = '{entry_id}'").execute()
+        
+        return rank
+    
+    def get_leaderboard(
+        self,
+        category: str,
+        period: str,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get leaderboard entries.
+        
+        Args:
+            category: Leaderboard category
+            period: Period identifier
+            limit: Maximum number of entries
+        
+        Returns:
+            List of leaderboard entries sorted by rank
+        """
+        self._ensure_initialized()
+        
+        if not self._table_exists("leaderboards"):
+            return []
+        
+        table = self.db.open_table("leaderboards")
+        results = table.search().where(
+            f"category = '{category}' AND period = '{period}'"
+        ).to_list()
+        
+        # Sort by rank
+        sorted_results = sorted(results, key=lambda x: x.get("rank", 999999))
+        
+        return sorted_results[:limit]
 
 
 # Global database manager instance
@@ -538,6 +771,9 @@ async def initialize_database():
     db_manager.initialize()
     db_manager.create_table()
     db_manager.create_user_progress_table()
+    db_manager.create_achievements_table()
+    db_manager.create_user_achievements_table()
+    db_manager.create_leaderboards_table()
 
 
 async def close_database():

@@ -37,6 +37,7 @@ dependencies = [
     "mojimoji>=0.0.13",
     "pygame",
     "playsound",
+    "openai-whisper>=20231117",
 ]
 
 [project.optional-dependencies]

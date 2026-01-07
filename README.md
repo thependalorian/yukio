@@ -121,9 +121,15 @@ These endpoints use the RAG agent to generate structured content from ingested m
 
 ### Progress Tracking Endpoints
 - `GET /progress/{user_id}` - Get user progress statistics (XP, level, streak, etc.)
-- `POST /progress/{user_id}/record` - Record progress (lesson completion, vocab learned, etc.)
+- `POST /progress/{user_id}/record` - Record progress (lesson completion, vocab learned, etc.) - Returns `achievements_unlocked` array
 - `GET /progress/{user_id}/lessons` - Get user's lesson/vocab progress records
 - `GET /progress/{user_id}/stats` - Get progress statistics (weekly data, vocab mastery)
+
+### Gamification & Achievements Endpoints
+- `GET /achievements` - List all available achievements (28 achievements across 7 categories)
+- `GET /achievements/{user_id}` - Get user's unlocked achievements with timestamps
+- `GET /leaderboards/{category}` - Get leaderboard entries
+  - Query params: `category` (weekly_xp, monthly_xp, all_time_xp, weekly_streak, monthly_streak, pronunciation, lessons), `period` (weekly, monthly, all-time), `limit` (default: 100)
 
 ### Career Coaching Endpoints
 - `POST /career/rirekisho` - Generate Japanese resume (履歴書) or work history (職務経歴書)
@@ -137,6 +143,9 @@ Yukio uses **LanceDB** (not PostgreSQL) for local file-based storage:
 ### Tables
 - **`japanese_lessons`** - Document chunks from ingested markdown files (for RAG search)
 - **`user_progress`** - User progress tracking (lessons, vocabulary, quizzes, XP, streaks)
+- **`achievements`** - Achievement definitions (28 achievements across 7 categories)
+- **`user_achievements`** - User achievement unlocks with timestamps
+- **`leaderboards`** - Leaderboard entries for XP, streaks, lessons, and pronunciation
 
 ### Data Storage
 - **Vector embeddings**: Stored in LanceDB for semantic search
@@ -167,9 +176,11 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8058
 - **Lessons**: Browse and complete structured lessons (generated from RAG data)
 - **Vocabulary Practice**: Flashcard-style vocabulary learning
 - **Quiz**: Interactive quizzes with multiple question types
-- **Voice Practice**: Pronunciation practice with audio feedback
+- **Voice Practice**: Pronunciation practice with audio feedback and STT analysis
 - **Chat**: AI tutor conversation interface
 - **Progress**: Track XP, level, streak, and learning statistics
+- **Achievements**: 28 achievements across 7 categories with automatic unlocking
+- **Leaderboards**: Compete with others on XP, streaks, lessons, and pronunciation scores
 
 All frontend features use real API endpoints - no mock data.
 
@@ -181,6 +192,8 @@ This project's documentation has been consolidated into the `/docs` directory fo
 - **[Ingestion Pipeline](./docs/ingestion.md)**: A detailed walkthrough of the data processing and ingestion workflow, from PDF to vector search
 - **[TTS / Voice Generation](./docs/tts_voice.md)**: Instructions for setting up and using the optional Text-to-Speech features
 - **[API Reference](./docs/api_reference.md)**: Complete API endpoint documentation with request/response examples
+- **[STT Implementation](./STT_IMPLEMENTATION.md)**: Speech-to-Text integration with Whisper for pronunciation practice
+- **[Gamification System](./GAMIFICATION_COMPLETE.md)**: Complete gamification system with achievements, leaderboards, and XP rewards
 
 ## 🗺️ Project Status
 
@@ -190,6 +203,7 @@ This project's documentation has been consolidated into the `/docs` directory fo
 - [x] **Phase 4**: API Endpoints & Learning Content Generation
 - [x] **Phase 5**: Frontend Integration
 - [x] **Phase 6**: Progress Tracking & Gamification
+- [x] **Phase 7**: Speech-to-Text (STT) & Pronunciation Analysis
 
 ## Architecture Overview
 

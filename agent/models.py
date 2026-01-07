@@ -339,6 +339,23 @@ class VoicePhrase(BaseModel):
     category: str
 
 
+class PronunciationAnalysisRequest(BaseModel):
+    """Request model for pronunciation analysis."""
+    target_text: str = Field(..., description="Target Japanese text")
+    target_romaji: Optional[str] = Field(None, description="Target romaji (optional)")
+
+
+class PronunciationAnalysisResponse(BaseModel):
+    """Response model for pronunciation analysis."""
+    transcript: str = Field(..., description="Transcribed text from audio")
+    score: int = Field(..., description="Pronunciation score (0-100)", ge=0, le=100)
+    feedback: str = Field(..., description="Feedback message")
+    target_text: str = Field(..., description="Original target text")
+    target_romaji: str = Field(..., description="Target romaji used for comparison")
+    transcribed_romaji: Optional[str] = Field(None, description="Transcribed text in romaji")
+    achievements_unlocked: Optional[List[Dict[str, Any]]] = Field(None, description="Newly unlocked achievements")
+
+
 # Career Coaching Models
 class RirekishoRequest(BaseModel):
     """Request model for rirekisho generation."""
@@ -379,3 +396,45 @@ class TTSRequest(BaseModel):
         le=400,
         description="Speech rate in words per minute (50-400, default: 140 for slower, clearer, more natural speech)"
     )
+
+
+# Gamification Models
+class Achievement(BaseModel):
+    """Achievement definition model."""
+    id: str
+    name: str
+    description: str
+    icon: str
+    category: Literal["learning", "vocab", "pronunciation", "streak", "xp", "jlpt", "special"]
+    rarity: Literal["bronze", "silver", "gold", "platinum"]
+    criteria: Dict[str, Any]
+    xp_reward: int
+
+
+class UserAchievement(BaseModel):
+    """User achievement unlock model."""
+    id: str
+    user_id: str
+    achievement_id: str
+    unlocked_at: datetime
+    progress: Optional[Dict[str, Any]] = None
+
+
+class LeaderboardEntry(BaseModel):
+    """Leaderboard entry model."""
+    user_id: str
+    user_name: Optional[str] = None
+    score: int
+    rank: int
+    period: str  # "2025-W03", "2025-01", "all-time"
+
+
+class LeaderboardCategory(str, Enum):
+    """Leaderboard category enumeration."""
+    WEEKLY_XP = "weekly_xp"
+    MONTHLY_XP = "monthly_xp"
+    ALL_TIME_XP = "all_time_xp"
+    WEEKLY_STREAK = "weekly_streak"
+    MONTHLY_STREAK = "monthly_streak"
+    PRONUNCIATION = "pronunciation"
+    LESSONS = "lessons"
