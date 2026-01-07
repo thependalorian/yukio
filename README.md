@@ -125,6 +125,11 @@ These endpoints use the RAG agent to generate structured content from ingested m
 - `GET /progress/{user_id}/lessons` - Get user's lesson/vocab progress records
 - `GET /progress/{user_id}/stats` - Get progress statistics (weekly data, vocab mastery)
 
+### Career Coaching Endpoints
+- `POST /career/rirekisho` - Generate Japanese resume (履歴書) or work history (職務経歴書)
+  - Request body: `user_id`, `job_title` (optional), `company_name` (optional), `job_description` (optional), `document_type` (rirekisho/shokumu-keirekisho/both)
+  - Returns structured sections ready for filling out rirekisho templates
+
 ## Database Architecture
 
 Yukio uses **LanceDB** (not PostgreSQL) for local file-based storage:
@@ -149,6 +154,15 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8058
 ```
 
 ### Features
+
+### 🎵 Text-to-Speech (TTS)
+- **Automatic audio generation** for all responses
+- **Kokoro TTS** with anime-style Japanese voices
+- **Real-time text streaming** with automatic audio playback
+- **Voice configuration** via environment variables
+- See [TTS_AUDIO_INTEGRATION.md](./TTS_AUDIO_INTEGRATION.md) for details
+
+## Features
 - **Dashboard**: Overview of learning progress
 - **Lessons**: Browse and complete structured lessons (generated from RAG data)
 - **Vocabulary Practice**: Flashcard-style vocabulary learning

@@ -1,11 +1,8 @@
 #!/bin/bash
-# Start Yukio API with native TTS enabled (much faster on Apple Silicon)
+# Start Yukio API with native macOS TTS
 
-export YUKIO_USE_NATIVE_TTS=1
-
-echo "🍎 Starting Yukio API with native TTS enabled..."
-echo "   This will use macOS 'say' command instead of Dia TTS"
-echo "   Much faster on M1/M2/M3 Macs!"
+echo "🍎 Starting Yukio API with native macOS TTS..."
+echo "   Using macOS 'say' command for fast, reliable TTS"
 echo ""
 
 cd "$(dirname "$0")"

@@ -20,12 +20,18 @@ from .tools import (
     memory_search_tool,
     record_learning_tool,
     get_progress_tool,
+    get_resume_tool,
+    generate_rirekisho_tool,
+    generate_shokumu_keirekisho_tool,
     VectorSearchInput,
     HybridSearchInput,
     DocumentInput,
     DocumentListInput,
     MemorySearchInput,
-    RecordLearningInput
+    RecordLearningInput,
+    GetResumeInput,
+    GenerateRirekishoInput,
+    GenerateShokumuKeirekishoInput
 )
 
 # Load environment variables
@@ -266,6 +272,181 @@ async def record_learning(
         details=details
     )
     return await record_learning_tool(input_data)
+
+
+@rag_agent.tool
+async def get_resume(
+    ctx: RunContext[AgentDependencies],
+    query: str = "George Nekwaya resume work experience education skills"
+) -> List[Dict[str, Any]]:
+    """
+    REQUIRED TOOL: Get George's resume and career information from the knowledge base.
+    
+    ⚠️ MANDATORY: You MUST use this tool when George asks about resume, CV, career, work experience, 
+    job applications, rirekisho, education, skills, Buffr, or previous jobs. Do NOT try to answer 
+    without calling this tool first - you cannot access the resume data any other way.
+    
+    This tool retrieves George Nekwaya's complete resume including:
+    - Work experience (Buffr Inc. founder/CEO, ACT, Aquasaic, etc.)
+    - Education (MBA Brandeis International Business School, Engineering degree)
+    - Skills (AI/ML, fintech, data analytics, full-stack development)
+    - Projects and achievements
+    - Professional background and qualifications
+    
+    ALWAYS use this tool when George asks:
+    - "review my resume" → Call get_resume() first
+    - "what's in my resume" → Call get_resume() first
+    - "help with rirekisho" → Call get_resume() first
+    - "career advice" → Call get_resume() first
+    - Any question about work experience, education, or skills → Call get_resume() first
+    
+    Args:
+        query: Search query (default: "George Nekwaya resume work experience education skills")
+    
+    Returns:
+        List of resume chunks with work experience, education, and skills from GEORGE_NEKWAYA_RESUME.md
+    """
+    # Use the dedicated get_resume_tool from tools module
+    input_data = GetResumeInput(
+        query=query,
+        limit=15  # Get more chunks for comprehensive resume info
+    )
+    
+    results = await get_resume_tool(input_data)
+    
+    # Convert ChunkResult to dict for agent
+    return [
+        {
+            "content": r.content,
+            "score": r.score,
+            "document_title": r.document_title,
+            "document_source": r.document_source,
+            "chunk_id": r.chunk_id,
+            "metadata": r.metadata
+        }
+        for r in results
+    ]
+
+
+@rag_agent.tool
+async def generate_rirekisho(
+    ctx: RunContext[AgentDependencies],
+    job_title: Optional[str] = None,
+    company_name: Optional[str] = None,
+    job_description: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Generate a Japanese rirekisho (履歴書) - standardized personal information form for job applications.
+    
+    ⚠️ CRITICAL: After calling this tool, you MUST generate COMPLETE rirekisho sections in JAPANESE (日本語).
+    
+    This tool:
+    1. Retrieves George's resume data from the knowledge base
+    2. Returns resume context and required sections
+    3. YOU must then generate the actual rirekisho content using that context
+    
+    Use this tool when George asks to:
+    - Create a rirekisho
+    - Generate a Japanese resume
+    - Fill out a rirekisho template
+    - "create rirekisho from my resume"
+    
+    ⚠️ LANGUAGE REQUIREMENT: ALL content must be in JAPANESE (日本語), not English, Thai, or any other language.
+    
+    After calling this tool, generate these COMPLETE sections in Japanese business format (敬語):
+    - 職務要約 (Job Summary) - 200-300 words in Japanese
+    - 活用できる経験・知識・スキル (Experience, knowledge, and skills) - 3 bullet points in Japanese
+    - 職務経歴 (Work History) - Succinct summary in Japanese
+    - 技術スキル (Technical Skills) - List in Japanese
+    - 資格 (Qualifications) - List in Japanese
+    - 自己PR (Self-PR) - Full content in Japanese
+    - 語学力 (Language Skills) - List in Japanese
+    - 志望動機 (Motivation) - Full content in Japanese
+    
+    DO NOT just summarize - provide FULL content for each section in Japanese.
+    
+    Args:
+        job_title: Optional target job title for customization
+        company_name: Optional target company name for customization
+        job_description: Optional job description/requirements for customization
+    
+    Returns:
+        Dictionary with resume context and required sections - use this to generate the actual rirekisho in Japanese
+    """
+    user_id = ctx.deps.user_id or "george_nekwaya"
+    input_data = GenerateRirekishoInput(
+        user_id=user_id,
+        job_title=job_title,
+        company_name=company_name,
+        job_description=job_description
+    )
+    result = await generate_rirekisho_tool(input_data)
+    
+    # Add instruction for agent to generate content
+    if "error" not in result:
+        result["generation_instruction"] = (
+            "Now generate the actual rirekisho sections using the resume_context above. "
+            "Format each section clearly with headers. Use Japanese business format (敬語)."
+        )
+    
+    return result
+
+
+@rag_agent.tool
+async def generate_shokumu_keirekisho(
+    ctx: RunContext[AgentDependencies],
+    job_title: Optional[str] = None,
+    company_name: Optional[str] = None,
+    job_description: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Generate a Japanese shokumu-keirekisho (職務経歴書) - detailed work history document.
+    
+    ⚠️ IMPORTANT: This tool retrieves George's resume and returns context. After calling this tool,
+    you MUST use the returned resume_context to generate the actual shokumu-keirekisho sections in your response.
+    
+    This tool:
+    1. Retrieves George's resume data from the knowledge base
+    2. Returns resume context and required sections
+    3. YOU must then generate the actual shokumu-keirekisho content using that context
+    
+    Use this tool when George asks to:
+    - Create a shokumu-keirekisho
+    - Generate a detailed work history document
+    - Fill out a shokumu-keirekisho template
+    
+    After calling this tool, generate these sections in Japanese business format (敬語):
+    - 経歴要約 (Personal History Summary) - 200-300 characters
+    - 職務内容 (Work History) - Reverse chronological, detailed with quantifiable results
+    - 活用できる経験・知識・スキル (Qualifications, Knowledge, Skills)
+    - 自己PR (Self-PR) - STAR method examples
+    
+    Args:
+        job_title: Optional target job title for customization
+        company_name: Optional target company name for customization
+        job_description: Optional job description/requirements for customization
+    
+    Returns:
+        Dictionary with resume context and required sections - use this to generate the actual shokumu-keirekisho
+    """
+    user_id = ctx.deps.user_id or "george_nekwaya"
+    input_data = GenerateShokumuKeirekishoInput(
+        user_id=user_id,
+        job_title=job_title,
+        company_name=company_name,
+        job_description=job_description
+    )
+    result = await generate_shokumu_keirekisho_tool(input_data)
+    
+    # Add instruction for agent to generate content
+    if "error" not in result:
+        result["generation_instruction"] = (
+            "Now generate the actual shokumu-keirekisho sections using the resume_context above. "
+            "Format each section clearly with headers. Use Japanese business format (敬語). "
+            "Include specific numbers and quantifiable achievements."
+        )
+    
+    return result
 
 
 @rag_agent.tool

@@ -9,6 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional, Union
 from datetime import datetime
+from pathlib import Path
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -20,6 +21,19 @@ import aiohttp
 from dotenv import load_dotenv
 
 from .agent import rag_agent, AgentDependencies
+from .react_executor import execute_react_task
+
+# Optional LangGraph imports
+try:
+    from .graph import get_agent_graph
+    from .state import AgentState
+    from langchain_core.messages import HumanMessage
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    get_agent_graph = None
+    AgentState = None
+    HumanMessage = None
 from .db_utils import (
     initialize_database,
     close_database,
@@ -44,7 +58,11 @@ from .models import (
     Lesson,
     VocabWord,
     QuizQuestion,
-    VoicePhrase
+    VoicePhrase,
+    RirekishoRequest,
+    RirekishoResponse,
+    RirekishoSection,
+    TTSRequest
 )
 from .tools import (
     vector_search_tool,
@@ -55,6 +73,7 @@ from .tools import (
     DocumentListInput
 )
 from .tts import TTSManager
+from .security import validate_and_sanitize_message, detect_prompt_injection
 from fastapi.responses import Response
 import io
 import numpy as np
@@ -100,13 +119,29 @@ async def lifespan(app: FastAPI):
         logger.info("User progress table ready")
         
         # Initialize TTS manager (optional, won't break if unavailable)
+        # Check for preferred engine from environment
         global tts_manager
         try:
-            tts_manager = TTSManager()
-            if tts_manager.is_available():
-                logger.info("TTS (Dia) initialized and available")
+            preferred_engine = os.getenv("TTS_ENGINE", "auto")  # "native", "kokoro", or "auto"
+            preferred_voice = os.getenv("TTS_VOICE", "af_bella")  # Default to af_bella (less squeaky)
+            speech_rate = int(os.getenv("TTS_SPEECH_RATE", "140"))  # Slower default (140 WPM)
+            
+            if preferred_engine == "auto":
+                # Auto-select: prefer Kokoro if available (anime-style), else native
+                tts_manager = TTSManager(speech_rate=speech_rate, voice=preferred_voice)
             else:
-                logger.info("TTS (Dia) not available - voice features disabled")
+                tts_manager = TTSManager(
+                    engine=preferred_engine,
+                    speech_rate=speech_rate,
+                    voice=preferred_voice
+                )
+            
+            if tts_manager.is_available():
+                engine_name = tts_manager.engine
+                voice_info = f" (voice: {tts_manager.voice})" if tts_manager.voice else ""
+                logger.info(f"TTS ({engine_name}) initialized and available{voice_info}")
+            else:
+                logger.info("TTS not available - voice features disabled")
         except Exception as e:
             logger.warning(f"TTS initialization failed: {e}")
             tts_manager = None
@@ -478,12 +513,22 @@ async def health_check():
 async def chat(request: ChatRequest):
     """Non-streaming chat endpoint."""
     try:
+        # Validate and sanitize user input
+        sanitized_message, error = validate_and_sanitize_message(request.message)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        
+        # Log injection attempts (but continue processing)
+        is_injection, patterns = detect_prompt_injection(request.message)
+        if is_injection:
+            logger.warning(f"Prompt injection attempt detected for user {request.user_id}: {patterns}")
+        
         # Get or create session
         session_id = await get_or_create_session(request)
         
-        # Execute agent
+        # Execute agent with sanitized message
         response, tools_used = await execute_agent(
-            message=request.message,
+            message=sanitized_message,
             session_id=session_id,
             user_id=request.user_id
         )
@@ -504,6 +549,16 @@ async def chat(request: ChatRequest):
 async def chat_stream(request: ChatRequest):
     """Streaming chat endpoint using Server-Sent Events."""
     try:
+        # Validate and sanitize user input
+        sanitized_message, error = validate_and_sanitize_message(request.message)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        
+        # Log injection attempts (but continue processing)
+        is_injection, patterns = detect_prompt_injection(request.message)
+        if is_injection:
+            logger.warning(f"Prompt injection attempt detected for user {request.user_id}: {patterns}")
+        
         # Get or create session
         session_id = await get_or_create_session(request)
         
@@ -521,20 +576,265 @@ async def chat_stream(request: ChatRequest):
                 # Get conversation context
                 context = await get_conversation_context(session_id)
                 
+                # Detect resume/career-related queries and force tool usage
+                resume_keywords = ['resume', 'cv', 'rirekisho', 'shokumu-keirekisho', 'career', 'work experience', 
+                                 'job application', 'work history', 'buffr', 'previous job', 'education background']
+                user_message_lower = sanitized_message.lower()
+                is_resume_query = any(keyword in user_message_lower for keyword in resume_keywords)
+                
+                # Detect complex tasks that need ReAct reasoning
+                complex_task_keywords = ['create rirekisho', 'generate rirekisho', 'create shokumu', 'generate shokumu',
+                                        '履歴書を作成', '職務経歴書を作成']
+                needs_react = any(keyword in user_message_lower for keyword in complex_task_keywords)
+                
+                # Use LangGraph orchestration if enabled
+                use_langgraph = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
+                
+                if use_langgraph and LANGGRAPH_AVAILABLE:
+                    try:
+                        agent_graph = get_agent_graph()
+                        thread = {"configurable": {"thread_id": session_id}}
+                        
+                        # Initialize state
+                        initial_state = {
+                            "user_input": sanitized_message,
+                            "session_id": session_id,
+                            "user_id": request.user_id,
+                            "messages": [HumanMessage(content=sanitized_message)],
+                            "task_type": None,
+                            "needs_resume": is_resume_query,
+                            "resume_data": None,
+                            "agent_outcome": None,
+                            "tool_calls": [],
+                            "tool_results": [],
+                            "validation_errors": [],
+                            "needs_revision": False,
+                            "metadata": {}
+                        }
+                        
+                        # Save user message
+                        await add_message(
+                            session_id=session_id,
+                            role="user",
+                            content=sanitized_message,
+                            metadata={"user_id": request.user_id}
+                        )
+                        
+                        full_response = ""
+                        node_sequence = []
+                        
+                        # Stream graph execution
+                        async for event in agent_graph.astream(initial_state, thread, stream_mode="values"):
+                            for node_name, node_state in event.items():
+                                if node_name.startswith("__"):
+                                    continue
+                                
+                                node_sequence.append(node_name)
+                                
+                                # Stream node progress
+                                if node_name == "classify_task":
+                                    task_type = node_state.get("task_type", "unknown")
+                                    logger.info(f"LangGraph: Task classified as {task_type}")
+                                
+                                elif node_name == "load_resume":
+                                    resume_count = len(node_state.get("resume_data", []))
+                                    logger.info(f"LangGraph: Loaded {resume_count} resume chunks")
+                                
+                                elif node_name == "agent":
+                                    # Stream agent response
+                                    agent_outcome = node_state.get("agent_outcome", {})
+                                    response = agent_outcome.get("response", "")
+                                    if response:
+                                        # Stream response in chunks for better UX
+                                        chunk_size = 50
+                                        for i in range(0, len(response), chunk_size):
+                                            chunk = response[i:i + chunk_size]
+                                            yield f"data: {json.dumps({'type': 'text_delta', 'text': chunk})}\n\n"
+                                        full_response = response
+                                    else:
+                                        # If response is empty, check messages
+                                        messages = node_state.get("messages", [])
+                                        for msg in messages:
+                                            if hasattr(msg, 'content') and msg.content:
+                                                response = msg.content
+                                                # Stream response in chunks
+                                                chunk_size = 50
+                                                for i in range(0, len(response), chunk_size):
+                                                    chunk = response[i:i + chunk_size]
+                                                    yield f"data: {json.dumps({'type': 'text_delta', 'text': chunk})}\n\n"
+                                                full_response = response
+                                                break
+                                    
+                                    # Stream tool calls info
+                                    tool_calls = node_state.get("tool_calls", [])
+                                    if tool_calls:
+                                        tools_used = [tc.get("tool_name", "unknown") for tc in tool_calls]
+                                        logger.info(f"LangGraph: Agent used tools: {tools_used}")
+                                
+                                elif node_name == "validate":
+                                    errors = node_state.get("validation_errors", [])
+                                    if errors:
+                                        logger.warning(f"LangGraph: Validation found {len(errors)} errors")
+                                
+                                elif node_name == "revise":
+                                    logger.info("LangGraph: Revising output based on validation")
+                        
+                        # Get final state if response not captured during streaming
+                        if not full_response:
+                            final_state = agent_graph.get_state(thread).values
+                            agent_outcome = final_state.get("agent_outcome", {})
+                            full_response = agent_outcome.get("response", "")
+                            
+                            # If still no response, check messages in final state
+                            if not full_response:
+                                messages = final_state.get("messages", [])
+                                for msg in messages:
+                                    if hasattr(msg, 'content') and msg.content:
+                                        # Check if it's an AI message (not a HumanMessage)
+                                        msg_type = str(type(msg))
+                                        if 'AI' in msg_type or 'Assistant' in msg_type or 'AIMessage' in msg_type:
+                                            full_response = msg.content
+                                            # Stream the full response now since we missed it during streaming
+                                            logger.info(f"LangGraph: Streaming missed response ({len(full_response)} chars)")
+                                            chunk_size = 50
+                                            for i in range(0, len(full_response), chunk_size):
+                                                chunk = full_response[i:i + chunk_size]
+                                                yield f"data: {json.dumps({'type': 'text_delta', 'text': chunk})}\n\n"
+                                            break
+                            elif full_response:
+                                # Response found in agent_outcome but wasn't streamed - stream it now
+                                logger.info(f"LangGraph: Streaming response from final state ({len(full_response)} chars)")
+                                chunk_size = 50
+                                for i in range(0, len(full_response), chunk_size):
+                                    chunk = full_response[i:i + chunk_size]
+                                    yield f"data: {json.dumps({'type': 'text_delta', 'text': chunk})}\n\n"
+                        
+                        logger.info(f"LangGraph: Completed workflow: {' -> '.join(node_sequence)}, response length: {len(full_response) if full_response else 0}")
+                        
+                        # Clean response
+                        cleaned_response = clean_agent_response(full_response) if full_response else ""
+                        
+                        # Save response
+                        await add_message(
+                            session_id=session_id,
+                            role="assistant",
+                            content=cleaned_response,
+                            metadata={
+                                "user_id": request.user_id,
+                                "used_langgraph": True,
+                                "node_sequence": node_sequence
+                            }
+                        )
+                        
+                        # Generate and play TTS audio for the response (LangGraph path)
+                        # Use global tts_manager (defined at module level)
+                        global tts_manager
+                        logger.debug(f"LangGraph TTS check: tts_manager={tts_manager is not None}, available={tts_manager.is_available() if tts_manager else False}, response_len={len(cleaned_response) if cleaned_response else 0}")
+                        if tts_manager and tts_manager.is_available() and cleaned_response:
+                            try:
+                                # Extract Japanese text or use full response
+                                import re
+                                japanese_text = re.findall(r'[ぁ-んァ-ン一-龯]+', cleaned_response)
+                                tts_text = ' '.join(japanese_text) if japanese_text else cleaned_response
+                                
+                                # Limit text length for TTS (avoid very long responses)
+                                max_tts_length = 500
+                                if len(tts_text) > max_tts_length:
+                                    tts_text = tts_text[:max_tts_length] + "..."
+                                
+                                # Generate TTS and save to tts_output.wav
+                                tts_output_path = "./yukio_data/audio/tts_output.wav"
+                                logger.info(f"Generating TTS for LangGraph response (length: {len(tts_text)} chars)")
+                                
+                                # Generate and save (don't auto-play in API, let frontend handle playback)
+                                audio = tts_manager.generate_speech(tts_text, verbose=False)
+                                if audio is not None:
+                                    sample_rate = 24000 if tts_manager.engine == "kokoro" else 44100
+                                    tts_manager.save_audio(tts_output_path, audio, sample_rate=sample_rate)
+                                    logger.info(f"TTS audio saved to: {tts_output_path}")
+                                    
+                                    # Send TTS ready signal to frontend with accessible URL
+                                    audio_url = f"/api/audio/tts_output.wav"
+                                    yield f"data: {json.dumps({'type': 'tts_ready', 'audio_path': audio_url})}\n\n"
+                            except Exception as e:
+                                logger.warning(f"TTS generation failed: {e}")
+                        
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                    except Exception as e:
+                        logger.warning(f"LangGraph execution failed: {e}, falling back to ReAct", exc_info=True)
+                        use_langgraph = False
+                
+                # Use ReAct executor for complex tasks
+                if needs_react and not use_langgraph:
+                    logger.info(f"Complex task detected, using ReAct executor: {sanitized_message}")
+                    task_description = sanitized_message
+                    
+                    async for react_result in execute_react_task(
+                        task=task_description,
+                        user_message=sanitized_message,
+                        session_id=session_id,
+                        user_id=request.user_id,
+                        stream=True
+                    ):
+                        # Stream ReAct results
+                        if react_result.get("type") == "reasoning_step":
+                            yield f"data: {json.dumps({'type': 'reasoning', 'content': react_result.get('content', '')})}\n\n"
+                        elif react_result.get("type") == "validation":
+                            yield f"data: {json.dumps({'type': 'validation', 'status': react_result.get('status'), 'content': react_result.get('content', '')})}\n\n"
+                        elif react_result.get("type") == "intermediate":
+                            yield f"data: {json.dumps({'type': 'text_delta', 'text': react_result.get('content', '')})}\n\n"
+                        elif react_result.get("type") == "final_output":
+                            yield f"data: {json.dumps({'type': 'text_delta', 'text': react_result.get('content', '')})}\n\n"
+                            full_response = react_result.get('content', '')
+                    
+                    # Save assistant response
+                    await add_message(
+                        session_id=session_id,
+                        role="assistant",
+                        content=full_response,
+                        metadata={"user_id": request.user_id, "used_react": True}
+                    )
+                    
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+                
                 # Build input with context
-                full_prompt = request.message
+                full_prompt = sanitized_message
                 if context:
                     context_str = "\n".join([
                         f"{msg['role']}: {msg['content']}"
                         for msg in context[-6:]
                     ])
-                    full_prompt = f"Previous conversation:\n{context_str}\n\nCurrent question: {request.message}"
+                    full_prompt = f"Previous conversation:\n{context_str}\n\nCurrent question: {sanitized_message}"
+                
+                # Force tool usage for resume queries
+                if is_resume_query:
+                    full_prompt = f"""CRITICAL: The user is asking about their resume or career. You MUST use the get_resume() tool FIRST - this is MANDATORY.
+
+User's question: {sanitized_message}
+
+MANDATORY STEPS (DO NOT SKIP):
+1. IMMEDIATELY call get_resume() tool - this is REQUIRED, not optional. You cannot proceed without this.
+2. Wait for the tool results - the tool will return George's complete resume data
+3. Use ONLY the resume information from get_resume() tool results to answer
+4. Do NOT use vector_search() or hybrid_search() - use ONLY get_resume()
+5. For resume reviews, respond in ENGLISH (not Japanese) for clarity
+6. Do NOT ask George for information - you have it all from get_resume()
+
+If the user asks to review the resume:
+- Call get_resume() first
+- Analyze the returned data
+- Provide comprehensive feedback in English
+- Be specific about strengths, improvements, and suggestions
+
+{full_prompt}"""
                 
                 # Save user message immediately
                 await add_message(
                     session_id=session_id,
                     role="user",
-                    content=request.message,
+                    content=sanitized_message,
                     metadata={"user_id": request.user_id}
                 )
                 
@@ -542,8 +842,13 @@ async def chat_stream(request: ChatRequest):
                 
                 # Stream using agent.iter() pattern
                 async with rag_agent.iter(full_prompt, deps=deps) as run:
+                    tool_calls_detected = False
                     async for node in run:
-                        if rag_agent.is_model_request_node(node):
+                        # Check if this is a tool call node
+                        if hasattr(rag_agent, 'is_tool_call_node') and rag_agent.is_tool_call_node(node):
+                            tool_calls_detected = True
+                            logger.info(f"Tool call detected: {node}")
+                        elif rag_agent.is_model_request_node(node):
                             # Stream tokens from the model
                             async with node.stream(run.ctx) as request_stream:
                                 async for event in request_stream:
@@ -562,6 +867,12 @@ async def chat_stream(request: ChatRequest):
                 # Extract tools used from the final result
                 result = run.result
                 tools_used = extract_tool_calls(result)
+                
+                # Log tool usage for debugging
+                if is_resume_query:
+                    logger.info(f"Resume query detected. Tools used: {[t.tool_name for t in tools_used]}")
+                    if not any(t.tool_name == 'get_resume' for t in tools_used):
+                        logger.warning("⚠️ Resume query but get_resume() tool was NOT called!")
                 
                 # Send tools used information
                 if tools_used:
@@ -588,6 +899,36 @@ async def chat_stream(request: ChatRequest):
                         "tool_calls": len(tools_used)
                     }
                 )
+                
+                # Generate and play TTS audio for the response
+                if tts_manager and tts_manager.is_available() and cleaned_response:
+                    try:
+                        # Extract Japanese text or use full response
+                        import re
+                        japanese_text = re.findall(r'[ぁ-んァ-ン一-龯]+', cleaned_response)
+                        tts_text = ' '.join(japanese_text) if japanese_text else cleaned_response
+                        
+                        # Limit text length for TTS (avoid very long responses)
+                        max_tts_length = 500
+                        if len(tts_text) > max_tts_length:
+                            tts_text = tts_text[:max_tts_length] + "..."
+                        
+                        # Generate TTS and save to tts_output.wav
+                        tts_output_path = "./yukio_data/audio/tts_output.wav"
+                        logger.info(f"Generating TTS for response (length: {len(tts_text)} chars)")
+                        
+                        # Generate and save (don't auto-play in API, let frontend handle playback)
+                        audio = tts_manager.generate_speech(tts_text, verbose=False)
+                        if audio is not None:
+                            sample_rate = 24000 if tts_manager.engine == "kokoro" else 44100
+                            tts_manager.save_audio(tts_output_path, audio, sample_rate=sample_rate)
+                            logger.info(f"TTS audio saved to: {tts_output_path}")
+                            
+                            # Send TTS ready signal to frontend with accessible URL
+                            audio_url = f"/api/audio/tts_output.wav"
+                            yield f"data: {json.dumps({'type': 'tts_ready', 'audio_path': audio_url})}\n\n"
+                    except Exception as e:
+                        logger.warning(f"TTS generation failed: {e}")
                 
                 yield f"data: {json.dumps({'type': 'end'})}\n\n"
                 
@@ -1109,10 +1450,55 @@ async def get_progress_stats(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/tts")
-async def text_to_speech(request: Dict[str, Any]):
+@app.get("/api/audio/{filename}")
+async def get_audio_file(filename: str):
     """
-    Generate speech from text using Dia TTS.
+    Serve TTS audio files to the frontend.
+    
+    Args:
+        filename: Audio filename (e.g., tts_output.wav)
+    
+    Returns:
+        Audio file as binary response
+    """
+    try:
+        audio_path = Path(f"./yukio_data/audio/{filename}")
+        
+        if not audio_path.exists():
+            raise HTTPException(status_code=404, detail=f"Audio file not found: {filename}")
+        
+        # Read and return audio file
+        with open(audio_path, 'rb') as f:
+            audio_bytes = f.read()
+        
+        # Determine content type based on extension
+        content_type = "audio/wav"
+        if filename.endswith('.mp3'):
+            content_type = "audio/mpeg"
+        elif filename.endswith('.ogg'):
+            content_type = "audio/ogg"
+        
+        return Response(
+            content=audio_bytes,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f"inline; filename={filename}",
+                "Content-Length": str(len(audio_bytes)),
+                "Cache-Control": "no-cache"  # Always fetch latest audio
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to serve audio file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to serve audio: {str(e)}")
+
+
+@app.post("/api/tts")
+async def text_to_speech(request: TTSRequest):
+    """
+    Generate speech from text using macOS native TTS.
     
     Request body:
         {
@@ -1127,24 +1513,21 @@ async def text_to_speech(request: Dict[str, Any]):
     if tts_manager is None or not tts_manager.is_available():
         raise HTTPException(
             status_code=503,
-            detail="TTS service not available. Dia TTS is not installed or failed to load."
+            detail="TTS service not available. macOS native TTS requires macOS."
         )
     
     try:
-        text = request.get("text", "")
-        if not text:
-            raise HTTPException(status_code=400, detail="Text parameter is required")
+        if not request.text or not request.text.strip():
+            raise HTTPException(status_code=400, detail="Text parameter is required and cannot be empty")
         
-        logger.info(f"Generating TTS for text: {text[:50]}...")
+        logger.info(f"Generating TTS for text: {request.text[:50]}... (rate: {request.speech_rate} WPM)")
         
-        # Format Japanese text to Romaji if needed
-        formatted_text = tts_manager.format_japanese_text(text)
-        
-        # Generate speech
+        # Generate speech (native TTS handles Japanese directly)
+        # Use slower rate (160 WPM default) for clearer, more natural speech
         audio_array = tts_manager.generate_speech(
-            formatted_text,
-            max_tokens=300,  # Conservative limit for reliability
-            verbose=False
+            request.text,
+            verbose=False,
+            speech_rate=request.speech_rate
         )
         
         if audio_array is None:
@@ -1174,7 +1557,7 @@ async def text_to_speech(request: Dict[str, Any]):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"TTS generation error: {e}")
+        logger.error(f"TTS generation error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
 
@@ -1189,6 +1572,201 @@ async def global_exception_handler(request: Request, exc: Exception):
         error_type=type(exc).__name__,
         request_id=str(uuid.uuid4())
     )
+
+
+@app.post("/career/rirekisho", response_model=RirekishoResponse)
+async def generate_rirekisho(request: RirekishoRequest):
+    """
+    Generate a Japanese resume (履歴書) or work history (職務経歴書) based on user's resume data.
+    
+    This endpoint:
+    1. Searches the knowledge base for the user's resume information
+    2. Uses the AI agent to generate appropriate Japanese resume content
+    3. Returns structured sections ready for filling out rirekisho templates
+    
+    Request body:
+        {
+            "user_id": "george_nekwaya",
+            "job_title": "Data Analyst" (optional),
+            "company_name": "Company Name" (optional),
+            "job_description": "Job description..." (optional),
+            "document_type": "rirekisho" | "shokumu-keirekisho" | "both"
+        }
+    """
+    try:
+        logger.info(f"Generating {request.document_type} for user {request.user_id}")
+        
+        # Search for user's resume in the knowledge base using vector search tool
+        from .tools import vector_search_tool, VectorSearchInput
+        
+        resume_query = f"George Nekwaya resume work experience education skills {request.user_id}"
+        search_input = VectorSearchInput(query=resume_query, limit=10)
+        resume_results = await vector_search_tool(search_input)
+        
+        if not resume_results:
+            logger.warning(f"No resume data found for user {request.user_id}")
+            # Still proceed, agent can work with general knowledge
+        
+        # Build context for the agent
+        resume_context = "\n\n".join([
+            f"**{r.document_title if hasattr(r, 'document_title') else 'Resume'}**\n{r.content if hasattr(r, 'content') else str(r)}"
+            for r in resume_results[:5]
+        ])
+        
+        # Create prompt for rirekisho generation
+        job_context = ""
+        if request.job_title:
+            job_context += f"Target Position: {request.job_title}\n"
+        if request.company_name:
+            job_context += f"Target Company: {request.company_name}\n"
+        if request.job_description:
+            job_context += f"Job Requirements:\n{request.job_description}\n"
+        
+        if request.document_type == "rirekisho":
+            prompt = f"""Based on the following resume information, help create a Japanese rirekisho (履歴書) document.
+
+RESUME INFORMATION:
+{resume_context}
+
+JOB CONTEXT:
+{job_context if job_context else "General job application"}
+
+Please provide the following sections in Japanese business format (敬語):
+1. 職務要約 (Job Summary) - 200-300 words describing work experience, strengths, and how you can contribute
+2. 活用できる経験・知識・スキル (Experience, knowledge, and skills) - 3 bullet points
+3. 職務経歴 (Work History) - Succinct summary of each job
+4. 技術スキル (Technical Skills) - Computer skills, software, programming languages
+5. 資格 (Qualifications) - Certifications and licenses
+6. 自己PR (Self-PR) - Specific examples demonstrating skills, motivation, and enthusiasm
+7. 語学力 (Language Skills) - Japanese proficiency level
+8. 志望動機 (Motivation) - Why you want to work in Japan/for this company
+
+Format your response as structured sections with clear labels."""
+        
+        elif request.document_type == "shokumu-keirekisho":
+            prompt = f"""Based on the following resume information, help create a Japanese shokumu-keirekisho (職務経歴書) document.
+
+RESUME INFORMATION:
+{resume_context}
+
+JOB CONTEXT:
+{job_context if job_context else "General job application"}
+
+Please provide the following sections in Japanese business format (敬語):
+1. 経歴要約 (Personal History Summary) - 200-300 characters, career overview, key achievements
+2. 職務内容 (Work History) - Reverse chronological order, detailed responsibilities, quantifiable results
+3. 活用できる経験・知識・スキル (Qualifications, Knowledge, Skills) - Organized by category
+4. 自己PR (Self-PR) - Use STAR method, connect to job requirements
+
+Format your response as structured sections with clear labels."""
+        
+        else:  # both
+            prompt = f"""Based on the following resume information, help create both a Japanese rirekisho (履歴書) and shokumu-keirekisho (職務経歴書).
+
+RESUME INFORMATION:
+{resume_context}
+
+JOB CONTEXT:
+{job_context if job_context else "General job application"}
+
+Please provide sections for both documents in Japanese business format (敬語). Format your response as structured sections with clear labels."""
+        
+        # Use the agent to generate content
+        session_id = f"rirekisho_{request.user_id}_{uuid.uuid4().hex[:8]}"
+        deps = AgentDependencies(
+            session_id=session_id,
+            user_id=request.user_id
+        )
+        
+        # Get agent response
+        result = await rag_agent.run(prompt, deps=deps)
+        
+        # Parse the response - PydanticAI returns result.output (as seen in other endpoints)
+        try:
+            response_text = result.output
+        except AttributeError:
+            # Fallback if output attribute doesn't exist
+            try:
+                response_text = result.data
+            except AttributeError:
+                response_text = str(result)
+        
+        # Create sections (simplified - in production, you'd want more sophisticated parsing)
+        sections = []
+        
+        # Common section patterns
+        section_patterns = {
+            "職務要約": ["職務要約", "Job Summary"],
+            "活用できる経験・知識・スキル": ["活用できる経験", "Experience", "Skills"],
+            "職務経歴": ["職務経歴", "Work History", "Work Experience"],
+            "技術スキル": ["技術スキル", "Technical Skills"],
+            "資格": ["資格", "Qualifications"],
+            "自己PR": ["自己PR", "Self-PR", "自己紹介"],
+            "語学力": ["語学力", "Language Skills"],
+            "志望動機": ["志望動機", "Motivation", "志望理由"],
+            "経歴要約": ["経歴要約", "Personal History Summary"],
+            "職務内容": ["職務内容", "Work History Details"]
+        }
+        
+        # Simple section extraction (can be improved)
+        lines = response_text.split('\n')
+        current_section = None
+        current_content = []
+        
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # Check if this is a section header
+            found_section = None
+            for section_name, patterns in section_patterns.items():
+                if any(pattern in line_stripped for pattern in patterns):
+                    # Save previous section
+                    if current_section and current_content:
+                        sections.append(RirekishoSection(
+                            section_name=current_section,
+                            section_name_jp=current_section,
+                            content="\n".join(current_content),
+                            content_jp="\n".join(current_content)
+                        ))
+                    current_section = section_name
+                    current_content = []
+                    found_section = section_name
+                    break
+            
+            if not found_section and current_section:
+                current_content.append(line_stripped)
+        
+        # Add last section
+        if current_section and current_content:
+            sections.append(RirekishoSection(
+                section_name=current_section,
+                section_name_jp=current_section,
+                content="\n".join(current_content),
+                content_jp="\n".join(current_content)
+            ))
+        
+        # If no sections found, create a single section with all content
+        if not sections:
+            sections.append(RirekishoSection(
+                section_name="complete_document",
+                section_name_jp="完全な文書",
+                content=response_text,
+                content_jp=response_text
+            ))
+        
+        return RirekishoResponse(
+            user_id=request.user_id,
+            document_type=request.document_type,
+            sections=sections,
+            job_title=request.job_title,
+            company_name=request.company_name
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to generate rirekisho: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate rirekisho: {str(e)}")
 
 
 # Development server

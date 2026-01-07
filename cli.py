@@ -238,7 +238,8 @@ class YukioCLI:
                             audio_filename = audio_dir / f"yukio_response_{timestamp}.wav"
                             
                             # Format text for TTS - this now handles Romaji conversion
-                            tts_text = self.tts_manager.format_japanese_text(full_response)
+                            # Native TTS handles Japanese directly, no conversion needed
+                            tts_text = full_response
                             
                             if not tts_text:
                                 print(f"{Colors.YELLOW}⚠ Text could not be formatted for TTS. Skipping voice generation.{Colors.END}")

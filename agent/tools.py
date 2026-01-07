@@ -2,8 +2,8 @@
 Tools for the Yukio Japanese Tutor AI agent.
 
 This module provides RAG (Retrieval-Augmented Generation) tools optimized
-for Japanese language learning. Uses LanceDB for vector storage and Mem0
-for conversation memory.
+for Japanese language learning and career coaching. Uses LanceDB for vector
+storage and Mem0 for conversation memory.
 
 Available Tools:
 - vector_search_tool: Semantic similarity search across Japanese learning materials
@@ -12,13 +12,26 @@ Available Tools:
 - list_documents_tool: List available learning materials
 - memory_search_tool: Search student's learning history
 - record_learning_tool: Record what the student has learned
+- record_mistake_tool: Record student mistakes for review
 - get_progress_tool: Get student's learning progress
+- get_review_items_tool: Get items scheduled for review
+- get_resume_tool: Retrieve resume/career information from knowledge base
+- generate_rirekisho_tool: Generate Japanese rirekisho (履歴書) resume sections
+- generate_shokumu_keirekisho_tool: Generate Japanese shokumu-keirekisho (職務経歴書) work history
+- perform_comprehensive_search: Combined search across learning materials and memory
 
 Usage:
     from agent.tools import vector_search_tool, VectorSearchInput
 
     results = await vector_search_tool(
         VectorSearchInput(query="hiragana basics", limit=10)
+    )
+    
+    # Career coaching tools
+    from agent.tools import get_resume_tool, GetResumeInput
+    
+    resume_data = await get_resume_tool(
+        GetResumeInput(query="George Nekwaya resume", limit=15)
     )
 """
 
@@ -118,6 +131,31 @@ class RecordMistakeInput(BaseModel):
     mistake_type: str = Field(..., description="Type of mistake")
     details: str = Field(..., description="What the mistake was")
     correction: str = Field(..., description="The correct answer")
+
+
+class GetResumeInput(BaseModel):
+    """Input for getting resume/career information."""
+    query: str = Field(
+        default="George Nekwaya resume work experience education skills Buffr",
+        description="Search query for resume data (default searches for complete resume)"
+    )
+    limit: int = Field(default=15, description="Maximum number of resume chunks to return")
+
+
+class GenerateRirekishoInput(BaseModel):
+    """Input for generating rirekisho (履歴書)."""
+    user_id: str = Field(default="george_nekwaya", description="User ID")
+    job_title: Optional[str] = Field(None, description="Target job title (optional)")
+    company_name: Optional[str] = Field(None, description="Target company name (optional)")
+    job_description: Optional[str] = Field(None, description="Job description/requirements (optional)")
+
+
+class GenerateShokumuKeirekishoInput(BaseModel):
+    """Input for generating shokumu-keirekisho (職務経歴書)."""
+    user_id: str = Field(default="george_nekwaya", description="User ID")
+    job_title: Optional[str] = Field(None, description="Target job title (optional)")
+    company_name: Optional[str] = Field(None, description="Target company name (optional)")
+    job_description: Optional[str] = Field(None, description="Job description/requirements (optional)")
 
 
 # Tool Implementation Functions
@@ -464,6 +502,63 @@ async def get_review_items_tool(limit: int = 10) -> List[Dict[str, Any]]:
         return []
 
 
+async def get_resume_tool(input_data: GetResumeInput) -> List[ChunkResult]:
+    """
+    Get George's resume and career information from the knowledge base.
+    
+    This tool specifically searches for and returns resume-related documents
+    containing George Nekwaya's work experience, education, skills, and achievements.
+    
+    The tool:
+    1. Performs vector search for resume-related content
+    2. Filters results to only include resume documents (GEORGE_NEKWAYA_RESUME.md)
+    3. Returns comprehensive resume chunks for analysis
+    
+    Args:
+        input_data: Search parameters with default query optimized for resume retrieval
+    
+    Returns:
+        List of resume chunks with work experience, education, skills, and achievements
+    """
+    try:
+        # Use vector search to find resume data
+        search_results = await vector_search_tool(
+            VectorSearchInput(
+                query=input_data.query,
+                limit=input_data.limit * 2  # Get more results to filter from
+            )
+        )
+        
+        # Filter for resume-related documents
+        resume_results = [
+            r for r in search_results
+            if "GEORGE" in r.document_title.upper() or 
+               "RESUME" in r.document_title.upper() or
+               "resume" in r.document_source.lower() or
+               r.metadata.get("type") == "resume_career_document" or
+               r.metadata.get("category") == "career_coaching"
+        ]
+        
+        # If we found resume-specific results, return them
+        if resume_results:
+            # Sort by score (best matches first) and limit
+            resume_results.sort(key=lambda x: x.score, reverse=True)
+            return resume_results[:input_data.limit]
+        
+        # If no resume-specific results but we have results, return top matches
+        # (they might still be relevant)
+        if search_results:
+            logger.info(f"No resume-specific documents found, returning top {input_data.limit} results")
+            return search_results[:input_data.limit]
+        
+        logger.warning("No resume data found in knowledge base")
+        return []
+        
+    except Exception as e:
+        logger.error(f"Failed to get resume: {e}")
+        return []
+
+
 # Combined search function for agent use
 async def perform_comprehensive_search(
     query: str,
@@ -515,3 +610,159 @@ async def perform_comprehensive_search(
     results["total_results"] = len(results["learning_materials"]) + len(results["student_memories"])
 
     return results
+
+
+async def generate_rirekisho_tool(input_data: GenerateRirekishoInput) -> Dict[str, Any]:
+    """
+    Generate a Japanese rirekisho (履歴書) - standardized personal information form.
+    
+    This tool:
+    1. Retrieves George's resume data from the knowledge base
+    2. Generates structured rirekisho sections in Japanese business format (敬語)
+    3. Returns sections ready for filling out rirekisho templates
+    
+    Rirekisho sections include:
+    - 職務要約 (Job Summary) - 200-300 words
+    - 活用できる経験・知識・スキル (Experience, knowledge, and skills)
+    - 職務経歴 (Work History)
+    - 技術スキル (Technical Skills)
+    - 資格 (Qualifications)
+    - 自己PR (Self-PR)
+    - 語学力 (Language Skills)
+    - 志望動機 (Motivation)
+    
+    Args:
+        input_data: Generation parameters including job title, company, and job description
+    
+    Returns:
+        Dictionary with structured rirekisho sections and resume context for agent to use
+    """
+    try:
+        # First, get resume data
+        resume_data = await get_resume_tool(
+            GetResumeInput(
+                query="George Nekwaya resume work experience education skills Buffr",
+                limit=15
+            )
+        )
+        
+        if not resume_data:
+            return {
+                "error": "No resume data found",
+                "sections": []
+            }
+        
+        # Build resume context
+        resume_context = "\n\n".join([
+            f"**{r.document_title}**\n{r.content}"
+            for r in resume_data[:5]
+        ])
+        
+        # Build job context
+        job_context = ""
+        if input_data.job_title:
+            job_context += f"Target Position: {input_data.job_title}\n"
+        if input_data.company_name:
+            job_context += f"Target Company: {input_data.company_name}\n"
+        if input_data.job_description:
+            job_context += f"Job Requirements:\n{input_data.job_description}\n"
+        
+        # Return structured data that the agent can use to generate the rirekisho
+        return {
+            "resume_context": resume_context,
+            "job_context": job_context,
+            "resume_chunks_count": len(resume_data),
+            "document_type": "rirekisho",
+            "sections_required": [
+                "職務要約 (Job Summary) - 200-300 words",
+                "活用できる経験・知識・スキル (Experience, knowledge, and skills) - 3 bullet points",
+                "職務経歴 (Work History) - Succinct summary",
+                "技術スキル (Technical Skills)",
+                "資格 (Qualifications)",
+                "自己PR (Self-PR)",
+                "語学力 (Language Skills)",
+                "志望動機 (Motivation)"
+            ],
+            "instructions": "Use the resume_context above to generate each section in Japanese business format (敬語). Format your response with clear section headers."
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate rirekisho: {e}")
+        return {
+            "error": str(e),
+            "sections": []
+        }
+
+
+async def generate_shokumu_keirekisho_tool(input_data: GenerateShokumuKeirekishoInput) -> Dict[str, Any]:
+    """
+    Generate a Japanese shokumu-keirekisho (職務経歴書) - detailed work history document.
+    
+    This tool:
+    1. Retrieves George's resume data from the knowledge base
+    2. Generates structured shokumu-keirekisho sections in Japanese business format (敬語)
+    3. Returns sections ready for filling out shokumu-keirekisho templates
+    
+    Shokumu-keirekisho sections include:
+    - 経歴要約 (Personal History Summary) - 200-300 characters
+    - 職務内容 (Work History) - Reverse chronological, detailed with quantifiable results
+    - 活用できる経験・知識・スキル (Qualifications, Knowledge, Skills)
+    - 自己PR (Self-PR) - STAR method examples
+    
+    Args:
+        input_data: Generation parameters including job title, company, and job description
+    
+    Returns:
+        Dictionary with structured shokumu-keirekisho sections and resume context for agent to use
+    """
+    try:
+        # First, get resume data
+        resume_data = await get_resume_tool(
+            GetResumeInput(
+                query="George Nekwaya resume work experience education skills Buffr",
+                limit=15
+            )
+        )
+        
+        if not resume_data:
+            return {
+                "error": "No resume data found",
+                "sections": []
+            }
+        
+        # Build resume context
+        resume_context = "\n\n".join([
+            f"**{r.document_title}**\n{r.content}"
+            for r in resume_data[:5]
+        ])
+        
+        # Build job context
+        job_context = ""
+        if input_data.job_title:
+            job_context += f"Target Position: {input_data.job_title}\n"
+        if input_data.company_name:
+            job_context += f"Target Company: {input_data.company_name}\n"
+        if input_data.job_description:
+            job_context += f"Job Requirements:\n{input_data.job_description}\n"
+        
+        # Return structured data that the agent can use to generate the shokumu-keirekisho
+        return {
+            "resume_context": resume_context,
+            "job_context": job_context,
+            "resume_chunks_count": len(resume_data),
+            "document_type": "shokumu-keirekisho",
+            "sections_required": [
+                "経歴要約 (Personal History Summary) - 200-300 characters",
+                "職務内容 (Work History) - Reverse chronological, detailed with quantifiable results",
+                "活用できる経験・知識・スキル (Qualifications, Knowledge, Skills)",
+                "自己PR (Self-PR) - STAR method examples"
+            ],
+            "instructions": "Use the resume_context above to generate each section in Japanese business format (敬語). Include specific numbers and quantifiable achievements. Format your response with clear section headers."
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate shokumu-keirekisho: {e}")
+        return {
+            "error": str(e),
+            "sections": []
+        }

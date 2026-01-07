@@ -337,3 +337,45 @@ class VoicePhrase(BaseModel):
     english: str
     difficulty: Literal["easy", "medium", "hard"] = "easy"
     category: str
+
+
+# Career Coaching Models
+class RirekishoRequest(BaseModel):
+    """Request model for rirekisho generation."""
+    user_id: str = Field(..., description="User identifier")
+    job_title: Optional[str] = Field(None, description="Target job title")
+    company_name: Optional[str] = Field(None, description="Target company name")
+    job_description: Optional[str] = Field(None, description="Job description or requirements")
+    document_type: Literal["rirekisho", "shokumu-keirekisho", "both"] = Field(
+        default="rirekisho",
+        description="Type of document to generate"
+    )
+
+
+class RirekishoSection(BaseModel):
+    """Section of a rirekisho document."""
+    section_name: str
+    section_name_jp: str
+    content: str
+    content_jp: Optional[str] = None
+
+
+class RirekishoResponse(BaseModel):
+    """Response model for rirekisho generation."""
+    user_id: str
+    document_type: str
+    sections: List[RirekishoSection] = Field(default_factory=list)
+    generated_at: datetime = Field(default_factory=datetime.now)
+    job_title: Optional[str] = None
+    company_name: Optional[str] = None
+
+
+class TTSRequest(BaseModel):
+    """Text-to-speech request model."""
+    text: str = Field(..., description="Text to convert to speech")
+    speech_rate: Optional[int] = Field(
+        default=140,
+        ge=50,
+        le=400,
+        description="Speech rate in words per minute (50-400, default: 140 for slower, clearer, more natural speech)"
+    )
